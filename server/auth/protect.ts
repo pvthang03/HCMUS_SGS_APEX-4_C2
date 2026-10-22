@@ -3,6 +3,8 @@ import { extractToken, verifyTideJWT, hasRole } from './tideJWT.js';
 import { verifyDpop, DpopError } from './verifyDpop.js';
 import type { JWTPayload } from 'jose';
 
+const APP_ROLES = ['approver', 'moderator', 'member'];
+
 export interface AuthenticatedRequest extends Request {
   user?: {
     id: string;
@@ -10,6 +12,7 @@ export interface AuthenticatedRequest extends Request {
     role: string;
     payload: JWTPayload;
     token: string;
+    dpopProof: string;
   };
 }
 
@@ -27,7 +30,7 @@ export async function withAuth(req: AuthenticatedRequest, res: Response, next: N
       });
     }
 
-    const { scheme, token } = extractToken(authHeader);
+    const { token } = extractToken(authHeader);
 
     // 1. Verify the access token signature, issuer, azp, and expiry
     let payload: JWTPayload;
@@ -59,18 +62,16 @@ export async function withAuth(req: AuthenticatedRequest, res: Response, next: N
       });
     }
 
-    // Extract primary role
-    const realmRoles = (payload.realm_access as any)?.roles || [];
-    const clientRoles = (payload.resource_access as any)?.['leashed-client']?.roles || [];
-    const roles = Array.from(new Set([...realmRoles, ...clientRoles]));
-    const primaryRole = (roles[0] as string) || 'member';
+    // Display role only. Authorization decisions call hasRole() on the verified payload.
+    const primaryRole = APP_ROLES.find((r) => hasRole(payload, r)) || 'member';
 
     req.user = {
       id: payload.sub as string,
       username: (payload.preferred_username as string) || (payload.sub as string),
       role: primaryRole,
       payload,
-      token
+      token,
+      dpopProof: String(req.headers['dpop'])
     };
 
     next();

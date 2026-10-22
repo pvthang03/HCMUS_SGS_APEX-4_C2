@@ -11,7 +11,7 @@ export const AgentLog: React.FC<AgentLogProps> = ({ logs, onRefresh }) => {
   const [expandedId, setExpandedId] = useState<string | null>(null);
 
   const filteredLogs = logs.filter((log) => {
-    if (filter === 'BLOCKED') return log.status === 'BLOCKED_BY_TIDECLOAK';
+    if (filter === 'BLOCKED') return log.status === 'BLOCKED';
     if (filter === 'ALLOWED') return log.status === 'ALLOWED' || log.status === 'PROPOSAL_SUBMITTED';
     return true;
   });
@@ -83,7 +83,7 @@ export const AgentLog: React.FC<AgentLogProps> = ({ logs, onRefresh }) => {
               border: '1px solid rgba(239, 68, 68, 0.4)'
             }}
           >
-            Blocked Attacks ({logs.filter((l) => l.status === 'BLOCKED_BY_TIDECLOAK').length})
+            Blocked Attacks ({logs.filter((l) => l.status === 'BLOCKED').length})
           </button>
           <button
             onClick={onRefresh}
@@ -119,9 +119,9 @@ export const AgentLog: React.FC<AgentLogProps> = ({ logs, onRefresh }) => {
       ) : (
         <div style={{ display: 'flex', flexDirection: 'column', gap: '0.75rem' }}>
           {filteredLogs.map((log) => {
-            const isBlocked = log.status === 'BLOCKED_BY_TIDECLOAK';
+            const isBlocked = log.status === 'BLOCKED';
             const isProposal = log.status === 'PROPOSAL_SUBMITTED';
-            const isFailed = log.status === 'FAILED';
+            const isFailed = log.status === 'COMPROMISED';
             const isExpanded = expandedId === log.id;
 
             return (
@@ -189,7 +189,7 @@ export const AgentLog: React.FC<AgentLogProps> = ({ logs, onRefresh }) => {
                             ? 'var(--warning-yellow)'
                             : 'var(--success-green)'
                         }}>
-                          {isBlocked ? '🛡️ BLOCKED BY TIDECLOAK' : log.status}
+                          {isBlocked ? '🛡️ REFUSED' : log.status}
                         </span>
 
                         {log.tier !== undefined && (
@@ -209,6 +209,11 @@ export const AgentLog: React.FC<AgentLogProps> = ({ logs, onRefresh }) => {
                         marginTop: '0.35rem'
                       }}>
                         {log.actionSummary}
+                        {log.enforcedBy && (
+                          <span style={{ display: 'block', fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.2rem' }}>
+                            Enforced by: {log.enforcedBy}
+                          </span>
+                        )}
                       </div>
                     </div>
                   </div>

@@ -1,123 +1,144 @@
-import policyData from '../data/policy.json' with { type: 'json' };
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'fs';
+import { dirname, join } from 'path';
+import genesisPolicy from '../data/policy.json' with { type: 'json' };
 import seedData from '../data/seed.json' with { type: 'json' };
+import { actionDigest, countQuorum, type ApprovalEvidence } from '../approvals/evidence.js';
 
-export interface ActionRequest {
-  type: 'PAYMENT' | 'ADD_VENDOR' | 'EXPORT_MEMBERS' | 'CHANGE_POLICY' | 'READ_LEDGER';
-  amount?: number;
-  payee?: string;
-  vendorName?: string;
-  policyChanges?: Record<string, any>;
-  proposerId?: string;
-  proposerRole?: string;
+export type Policy = typeof genesisPolicy;
+
+export interface PaymentAction {
+  kind: 'PAYMENT';
+  proposalId: string;
+  nonce: string;
+  invoiceId: string;
+  amount: number;
+  payee: string;
 }
 
-export interface PolicyTierEvaluation {
+export interface PolicyChangeAction {
+  kind: 'CHANGE_POLICY';
+  proposalId: string;
+  nonce: string;
+  basePolicyVersion: number;
+  newPolicy: Policy;
+  summary: string;
+}
+
+export type Action = PaymentAction | PolicyChangeAction;
+
+export interface TierEvaluation {
   tier: 0 | 1 | 2 | 3;
   tierName: string;
   requiredApprovers: number;
-  totalApproverPool: number;
-  description: string;
-  allowedApproverRoles: string[];
-  isApprovedVendor?: boolean;
 }
 
-// In-memory policy state (initialized from policy.json)
-let currentPolicy = JSON.parse(JSON.stringify(policyData));
-
-export function getPolicy() {
-  return currentPolicy;
+export interface PolicyAmendment {
+  action: PolicyChangeAction;
+  evidence: ApprovalEvidence[];
 }
 
-export function updatePolicy(newPolicy: any) {
-  currentPolicy = newPolicy;
+function amendmentsPath() {
+  return join(process.env.LEASHED_STATE_DIR || join(process.cwd(), 'data', 'state'), 'policy-amendments.json');
 }
 
-export function isVendorApproved(vendorIdOrName: string): boolean {
-  if (!vendorIdOrName) return false;
-  const normalized = vendorIdOrName.toLowerCase().trim();
+export function isVendorApproved(payee: string): boolean {
+  const n = payee.toLowerCase().trim();
   return seedData.vendors.some(
-    (v) =>
-      (v.id.toLowerCase() === normalized || v.name.toLowerCase() === normalized) &&
-      v.status === 'APPROVED'
+    (v) => (v.id.toLowerCase() === n || v.name.toLowerCase() === n) && v.status === 'APPROVED'
   );
 }
 
-/**
- * Determine the tier and required approvals for a given action
- */
-export function getRequiredApproval(action: ActionRequest): PolicyTierEvaluation {
-  const tiers = currentPolicy.tiers;
-
-  switch (action.type) {
-    case 'READ_LEDGER':
-      return {
-        tier: 0,
-        tierName: tiers['0'].name,
-        requiredApprovers: 0,
-        totalApproverPool: 3,
-        description: tiers['0'].description,
-        allowedApproverRoles: tiers['0'].allowedRoles
-      };
-
-    case 'PAYMENT': {
-      const amount = action.amount ?? 0;
-      const approved = isVendorApproved(action.payee || '');
-
-      // Tier 1: Under 50 credits AND to an already-approved vendor
-      if (amount > 0 && amount < 50 && approved) {
-        return {
-          tier: 1,
-          tierName: tiers['1'].name,
-          requiredApprovers: 1,
-          totalApproverPool: 3,
-          description: tiers['1'].description,
-          allowedApproverRoles: tiers['1'].allowedApproverRoles,
-          isApprovedVendor: true
-        };
-      }
-
-      // Tier 2: 50 credits or more, OR unapproved/new vendor
-      return {
-        tier: 2,
-        tierName: tiers['2'].name,
-        requiredApprovers: 2,
-        totalApproverPool: 3,
-        description: tiers['2'].description,
-        allowedApproverRoles: tiers['2'].allowedApproverRoles,
-        isApprovedVendor: approved
-      };
-    }
-
-    case 'ADD_VENDOR':
-    case 'EXPORT_MEMBERS':
-      return {
-        tier: 2,
-        tierName: tiers['2'].name,
-        requiredApprovers: 2,
-        totalApproverPool: 3,
-        description: tiers['2'].description,
-        allowedApproverRoles: tiers['2'].allowedApproverRoles
-      };
-
-    case 'CHANGE_POLICY':
-      return {
-        tier: 3,
-        tierName: tiers['3'].name,
-        requiredApprovers: 3,
-        totalApproverPool: 3,
-        description: tiers['3'].description,
-        allowedApproverRoles: tiers['3'].allowedApproverRoles
-      };
-
-    default:
-      // Default to Tier 2 for safety
-      return {
-        tier: 2,
-        tierName: 'Tier 2: Default High-Risk Quorum',
-        requiredApprovers: 2,
-        totalApproverPool: 3,
-        description: 'Unknown action type defaults to 2-of-3 quorum',
-        allowedApproverRoles: ['approver']
-      };
+export function evaluateTier(action: Action, policy: Policy): TierEvaluation {
+  const t = policy.tiers;
+  if (action.kind === 'CHANGE_POLICY') {
+    return { tier: 3, tierName: t['3'].name, requiredApprovers: t['3'].requiredApprovers };
   }
+  if (action.amount > 0 && action.amount < t['1'].maxAmountExclusive && isVendorApproved(action.payee)) {
+    return { tier: 1, tierName: t['1'].name, requiredApprovers: t['1'].requiredApprovers };
+  }
+  return { tier: 2, tierName: t['2'].name, requiredApprovers: t['2'].requiredApprovers };
+}
+
+/** Structural floor: no amendment may remove the human quorum entirely. */
+function validatePolicyShape(p: Policy): void {
+  const t = p.tiers;
+  if (t['1'].requiredApprovers < 1 || t['2'].requiredApprovers < 2 || t['3'].requiredApprovers < 2) {
+    throw new Error('Policy would drop a tier below its minimum quorum (1 / 2 / 2).');
+  }
+}
+
+/**
+ * Verify one amendment against the policy it replaces. Shared by load-time replay and by
+ * applyAmendment, so a restart enforces exactly what the live path enforced.
+ */
+async function verifyAmendment(current: Policy, a: PolicyAmendment, maxAgeSeconds?: number) {
+  if (a.action.basePolicyVersion !== current.version) {
+    throw new Error(`Amendment targets policy v${a.action.basePolicyVersion}, current is v${current.version}.`);
+  }
+  if (a.action.newPolicy.version !== current.version + 1) {
+    throw new Error('Amendment must bump the policy version by exactly one.');
+  }
+  validatePolicyShape(a.action.newPolicy);
+  const required = evaluateTier(a.action, current).requiredApprovers;
+  const { approvers, rejected } = await countQuorum(a.evidence, {
+    proposalId: a.action.proposalId,
+    digest: actionDigest(a.action),
+    maxAgeSeconds
+  });
+  if (approvers.length < required) {
+    throw new Error(
+      `Policy change needs ${required} Tide-signed approvals, has ${approvers.length}.` +
+        (rejected.length ? ` Rejected: ${rejected.join('; ')}` : '')
+    );
+  }
+  return approvers;
+}
+
+let currentPolicy: Policy = genesisPolicy;
+let amendments: PolicyAmendment[] = [];
+
+/**
+ * Rebuild the policy from the genesis file in git plus every amendment on disk, re-verifying
+ * each amendment's approval evidence. A tampered or unapproved amendment stops the replay, so
+ * editing the state file can only ever fall back to an older, stricter-or-equal policy.
+ */
+export async function loadPolicy(): Promise<void> {
+  currentPolicy = genesisPolicy;
+  amendments = [];
+  const path = amendmentsPath();
+  if (!existsSync(path)) return;
+  const stored: PolicyAmendment[] = JSON.parse(readFileSync(path, 'utf-8'));
+  for (const a of stored) {
+    try {
+      await verifyAmendment(currentPolicy, a);
+      currentPolicy = a.action.newPolicy;
+      amendments.push(a);
+    } catch (e: any) {
+      console.warn(`[policy] Ignoring amendment ${a.action?.proposalId}: ${e.message}`);
+      break;
+    }
+  }
+}
+
+export function getPolicy(): Policy {
+  return currentPolicy;
+}
+
+export function getAmendmentHistory() {
+  return amendments.map((a) => ({
+    proposalId: a.action.proposalId,
+    version: a.action.newPolicy.version,
+    summary: a.action.summary,
+    approvals: a.evidence.length
+  }));
+}
+
+export async function applyAmendment(a: PolicyAmendment) {
+  const approvers = await verifyAmendment(currentPolicy, a, 3600);
+  currentPolicy = a.action.newPolicy;
+  amendments.push(a);
+  const path = amendmentsPath();
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify(amendments, null, 2));
+  return approvers;
 }

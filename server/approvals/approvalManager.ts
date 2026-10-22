@@ -1,228 +1,141 @@
-import { createHash } from 'crypto';
-import { SignJWT, importJWK, type JWK } from 'jose';
-import { readFileSync } from 'fs';
-import { join } from 'path';
-import { getRequiredApproval, type ActionRequest, type PolicyTierEvaluation } from '../policy/policyEngine.js';
+import { randomBytes } from 'crypto';
+import { evaluateTier, getPolicy, type Action, type TierEvaluation } from '../policy/policyEngine.js';
+import {
+  actionDigest,
+  approvalPath,
+  verifyApprovalEvidence,
+  type ApprovalEvidence,
+  type VerifiedApproval
+} from './evidence.js';
 
-// Load VVK private key for Realm authority token signing
-const vvkPath = join(process.cwd(), 'server', 'data', 'tide-vvk-private.json');
-const vvkPrivJwk: JWK = JSON.parse(readFileSync(vvkPath, 'utf-8'));
+export interface Proposer {
+  kind: 'agent' | 'user';
+  username: string;
+  sub?: string;
+  /** e.g. "demo/poisoned-invoice.txt" — shown to approvers so they know what they are signing. */
+  source?: string;
+}
 
-export interface ApprovalRecord {
+/**
+ * A proposal is a queue entry, nothing more. It holds the action and the approval evidence
+ * collected so far; it cannot authorise anything. The bank and the policy store re-verify the
+ * evidence themselves before acting, so a bug or a malicious edit here cannot move money.
+ */
+export interface Proposal {
   id: string;
-  action: ActionRequest;
-  evaluation: PolicyTierEvaluation;
-  status: 'PENDING' | 'APPROVED' | 'REJECTED' | 'EXECUTED';
-  proposerId: string;
-  proposerUsername: string;
-  proposerRole: string;
-  approvals: Array<{
-    approverId: string;
-    approverUsername: string;
-    approvedAt: string;
-  }>;
-  rejections: Array<{
-    approverId: string;
-    approverUsername: string;
-    reason: string;
-    rejectedAt: string;
-  }>;
-  requiredApprovals: number;
-  currentApprovals: number;
-  nonce: string;
-  authorizationProof?: string;
+  action: Action;
+  digest: string;
+  evaluation: TierEvaluation;
+  proposer: Proposer;
+  status: 'PENDING' | 'REJECTED' | 'EXECUTED';
+  approvals: VerifiedApproval[];
+  evidence: ApprovalEvidence[];
+  rejections: Array<{ username: string; reason: string; at: string }>;
   createdAt: string;
   updatedAt: string;
-  executionResult?: any;
+  executionResult?: unknown;
 }
 
-// In-memory store for approval requests
-const approvalStore = new Map<string, ApprovalRecord>();
-
-/**
- * Compute canonical hash of action payload bound to nonce
- */
-export function computeActionHash(actionId: string, amount: number, payee: string, nonce: string): string {
-  const data = `${actionId}:${amount}:${payee}:${nonce}`;
-  return createHash('sha256').update(data).digest('hex');
+export class ApprovalError extends Error {
+  constructor(public status: number, message: string) {
+    super(message);
+  }
 }
 
-/**
- * Create a new approval request
- */
-export function createApprovalRequest(
-  action: ActionRequest,
-  proposer: { id: string; username: string; role: string }
-): ApprovalRecord {
-  const evaluation = getRequiredApproval(action);
-  const id = 'cr_' + Math.random().toString(36).substring(2, 9) + '_' + Date.now();
-  const nonce = 'nonce_' + createHash('sha256').update(id + Date.now()).digest('hex').substring(0, 16);
+const proposals = new Map<string, Proposal>();
 
-  const record: ApprovalRecord = {
+type ActionInput =
+  | Omit<Extract<Action, { kind: 'PAYMENT' }>, 'proposalId' | 'nonce'>
+  | Omit<Extract<Action, { kind: 'CHANGE_POLICY' }>, 'proposalId' | 'nonce'>;
+
+export function createProposal(input: ActionInput, proposer: Proposer): Proposal {
+  const id = 'prop_' + randomBytes(6).toString('hex');
+  const action = { ...input, proposalId: id, nonce: randomBytes(12).toString('hex') } as Action;
+  const now = new Date().toISOString();
+  const p: Proposal = {
     id,
     action,
-    evaluation,
+    digest: actionDigest(action),
+    evaluation: evaluateTier(action, getPolicy()),
+    proposer,
     status: 'PENDING',
-    proposerId: proposer.id,
-    proposerUsername: proposer.username,
-    proposerRole: proposer.role,
     approvals: [],
+    evidence: [],
     rejections: [],
-    requiredApprovals: evaluation.requiredApprovers,
-    currentApprovals: 0,
-    nonce,
-    createdAt: new Date().toISOString(),
-    updatedAt: new Date().toISOString()
+    createdAt: now,
+    updatedAt: now
   };
-
-  approvalStore.set(id, record);
-  return record;
+  proposals.set(id, p);
+  return p;
 }
 
-export function listApprovalRequests(status?: string): ApprovalRecord[] {
-  const all = Array.from(approvalStore.values());
-  if (status) {
-    return all.filter((r) => r.status === status);
-  }
-  return all.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+export function getProposal(id: string): Proposal | undefined {
+  return proposals.get(id);
 }
 
-export function getApprovalRequest(id: string): ApprovalRecord | undefined {
-  return approvalStore.get(id);
-}
-
-/**
- * Record an approval from a user
- */
-export async function submitApproval(
-  requestId: string,
-  approver: { id: string; username: string; role: string }
-): Promise<{ success: boolean; message: string; record: ApprovalRecord }> {
-  const record = approvalStore.get(requestId);
-  if (!record) {
-    throw new Error('Approval request not found');
-  }
-
-  if (record.status !== 'PENDING') {
-    throw new Error(`Cannot approve request in status '${record.status}'`);
-  }
-
-  // Invariant 1: Approver role check
-  if (approver.role !== 'approver') {
-    throw new Error(
-      `Role '${approver.role}' is not authorized to act as an approver. Only users with role 'approver' may sign.`
-    );
-  }
-
-  // Invariant 2: Agent can never be an approver
-  if (approver.role === 'agent' || approver.username === 'quartermaster') {
-    throw new Error('Agent identity is strictly prohibited from approving actions.');
-  }
-
-  // Invariant 3: Proposer cannot approve their own proposal
-  if (approver.id === record.proposerId || approver.username === record.proposerUsername) {
-    throw new Error('Anti-Self-Approval Invariant: The proposer cannot approve their own request.');
-  }
-
-  // Invariant 4: No double-approval from the same user
-  const alreadyApproved = record.approvals.some(
-    (a) => a.approverId === approver.id || a.approverUsername === approver.username
-  );
-  if (alreadyApproved) {
-    throw new Error('User has already approved this request. Duplicate approvals are rejected.');
-  }
-
-  // Record valid approval
-  record.approvals.push({
-    approverId: approver.id,
-    approverUsername: approver.username,
-    approvedAt: new Date().toISOString()
-  });
-
-  record.currentApprovals = record.approvals.length;
-  record.updatedAt = new Date().toISOString();
-
-  // Check if Quorum threshold is satisfied!
-  if (record.currentApprovals >= record.requiredApprovals) {
-    record.status = 'APPROVED';
-
-    // Tide Threshold Cryptographic Engine: Mint VVK-signed Authorization Proof
-    const actionHash = computeActionHash(
-      record.id,
-      record.action.amount || 0,
-      record.action.payee || '',
-      record.nonce
-    );
-
-    const signerKey = await importJWK(vvkPrivJwk, 'ES256');
-    const now = Math.floor(Date.now() / 1000);
-
-    const authorizationProof = await new SignJWT({
-      iss: 'http://localhost:8080/realms/leashed',
-      sub: `tide:authz:${record.id}`,
-      aud: 'leashed-bank-enclave',
-      actionId: record.id,
-      actionType: record.action.type,
-      amount: record.action.amount || 0,
-      payee: record.action.payee || '',
-      actionHash,
-      nonce: record.nonce,
-      tier: record.evaluation.tier,
-      requiredApprovers: record.requiredApprovals,
-      approvedCount: record.currentApprovals,
-      approvers: record.approvals.map((a) => a.approverUsername),
-      signedAt: new Date().toISOString()
-    })
-      .setProtectedHeader({ alg: 'ES256', kid: 'tide-vvk-key-2026', typ: 'tide-authz+jwt' })
-      .setIssuedAt(now)
-      .setExpirationTime(now + 600) // Valid for 10 minutes
-      .sign(signerKey);
-
-    record.authorizationProof = authorizationProof;
-
-    return {
-      success: true,
-      message: `Quorum reached (${record.currentApprovals}/${record.requiredApprovals}). Cryptographic authorization proof generated by TideCloak VVK.`,
-      record
-    };
-  }
-
+/** Client view: evidence tokens never leave the server. */
+export function publicView(p: Proposal) {
+  const { evidence, ...rest } = p;
   return {
-    success: true,
-    message: `Approval recorded (${record.currentApprovals}/${record.requiredApprovals} required). Quorum pending.`,
-    record
+    ...rest,
+    approvalPath: approvalPath(p.id, p.digest),
+    evidenceCount: evidence.length
   };
 }
 
+export function listProposals() {
+  return [...proposals.values()]
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+    .map(publicView);
+}
+
 /**
- * Record a rejection
+ * Record the evidence carried by an authenticated approve request. The request's own token and
+ * DPoP proof ARE the evidence, verified with the same function the bank uses.
  */
-export function rejectApproval(
-  requestId: string,
-  approver: { id: string; username: string; role: string },
-  reason: string
-): ApprovalRecord {
-  const record = approvalStore.get(requestId);
-  if (!record) {
-    throw new Error('Approval request not found');
+export async function recordApproval(
+  id: string,
+  digest: string,
+  evidence: ApprovalEvidence
+): Promise<Proposal> {
+  const p = proposals.get(id);
+  if (!p) throw new ApprovalError(404, 'Proposal not found.');
+  if (p.status !== 'PENDING') throw new ApprovalError(409, `Proposal is ${p.status}.`);
+  if (digest !== p.digest) {
+    throw new ApprovalError(409, 'Approval signs a different action digest than this proposal.');
   }
 
-  if (record.status !== 'PENDING') {
-    throw new Error(`Cannot reject request in status '${record.status}'`);
+  let v: VerifiedApproval;
+  try {
+    v = await verifyApprovalEvidence(evidence, { proposalId: id, digest, maxAgeSeconds: 120 });
+  } catch (e: any) {
+    throw new ApprovalError(403, e.message);
+  }
+  if (p.proposer.sub && v.sub === p.proposer.sub) {
+    throw new ApprovalError(403, 'The proposer cannot approve their own proposal.');
+  }
+  if (p.approvals.some((a) => a.sub === v.sub)) {
+    throw new ApprovalError(409, `${v.username} has already approved; a second approval does not count.`);
   }
 
-  if (approver.role !== 'approver' && approver.role !== 'admin') {
-    throw new Error(`Role '${approver.role}' is not authorized to reject proposals.`);
-  }
+  p.approvals.push(v);
+  p.evidence.push(evidence);
+  p.updatedAt = new Date().toISOString();
+  return p;
+}
 
-  record.rejections.push({
-    approverId: approver.id,
-    approverUsername: approver.username,
-    reason: reason || 'Rejected by council approver',
-    rejectedAt: new Date().toISOString()
-  });
+export function rejectProposal(id: string, username: string, reason: string): Proposal {
+  const p = proposals.get(id);
+  if (!p) throw new ApprovalError(404, 'Proposal not found.');
+  if (p.status !== 'PENDING') throw new ApprovalError(409, `Proposal is ${p.status}.`);
+  p.rejections.push({ username, reason: reason || 'Rejected', at: new Date().toISOString() });
+  p.status = 'REJECTED';
+  p.updatedAt = new Date().toISOString();
+  return p;
+}
 
-  record.status = 'REJECTED';
-  record.updatedAt = new Date().toISOString();
-  return record;
+export function markExecuted(p: Proposal, result: unknown) {
+  p.status = 'EXECUTED';
+  p.executionResult = result;
+  p.updatedAt = new Date().toISOString();
 }

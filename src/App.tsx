@@ -1,272 +1,146 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
+import { useTideCloak, useAuthCallback, Authenticated, Unauthenticated } from '@tidecloak/react';
 import { Header } from './components/Header';
 import { Dashboard } from './components/Dashboard';
 import { AgentLog } from './components/AgentLog';
 import { ApprovalsQueue } from './components/ApprovalsQueue';
 import { DemoPanel } from './components/DemoPanel';
-import { api, loginAs, getCurrentSession, subscribeSession, type User, type AuthSession } from './api/client';
-import { LayoutDashboard, Bot, CheckSquare, ShieldCheck, Terminal } from 'lucide-react';
+import { api, setSecureFetch, type Me } from './api/client';
+import { LayoutDashboard, CheckSquare, Terminal, Lock } from 'lucide-react';
 
+const center: React.CSSProperties = {
+  minHeight: '100vh', display: 'flex', flexDirection: 'column', alignItems: 'center',
+  justifyContent: 'center', gap: '1rem', color: 'var(--text-muted)', textAlign: 'center', padding: '2rem'
+};
+
+// isInitializing must be checked before the Authenticated/Unauthenticated guards.
 export const App: React.FC = () => {
-  const [session, setSession] = useState<AuthSession | null>(getCurrentSession());
-  const [users, setUsers] = useState<User[]>([]);
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'logs' | 'approvals'>('dashboard');
+  const { isInitializing, initError } = useTideCloak();
+  const { isCallback, isProcessing, error } = useAuthCallback({
+    onSuccess: (returnUrl) => window.location.assign(returnUrl || '/'),
+    onError: () => window.location.assign('/'),
+    onMissingVerifierRedirectTo: '/'
+  });
 
+  if (isCallback) {
+    if (error) return <div style={center}>Authentication failed: {error.message}</div>;
+    return <div style={center}>{isProcessing ? 'Completing Tide login…' : 'Redirecting…'}</div>;
+  }
+  if (initError) return <div style={center}>TideCloak failed to initialise: {initError.message}</div>;
+  if (isInitializing) return <div style={center}>Connecting to TideCloak…</div>;
+
+  return (
+    <>
+      <Authenticated>
+        <Treasury />
+      </Authenticated>
+      <Unauthenticated>
+        <Login />
+      </Unauthenticated>
+    </>
+  );
+};
+
+const Login: React.FC = () => {
+  const { login } = useTideCloak();
+  return (
+    <div style={center}>
+      <div style={{
+        width: 56, height: 56, borderRadius: 14, display: 'flex', alignItems: 'center', justifyContent: 'center',
+        background: 'linear-gradient(135deg, #0070F3 0%, #00E5FF 100%)'
+      }}>
+        <Lock size={28} color="#000" />
+      </div>
+      <h1 style={{ color: '#fff', fontSize: '1.8rem', fontWeight: 800 }}>Leashed</h1>
+      <p style={{ maxWidth: 520 }}>
+        An AI treasurer that can do the work but cannot move money alone. Sign in as a council approver or the
+        moderator; your Tide session is the only thing that can sign your approval.
+      </p>
+      <button
+        onClick={login}
+        style={{ padding: '0.8rem 1.6rem', borderRadius: 10, border: 'none', background: 'var(--primary-blue)', color: '#fff', fontWeight: 800 }}
+      >
+        Log in with Tide
+      </button>
+    </div>
+  );
+};
+
+const Treasury: React.FC = () => {
+  const { secureFetch, logout } = useTideCloak();
+  const [me, setMe] = useState<Me | null>(null);
+  const [tab, setTab] = useState<'dashboard' | 'approvals' | 'logs'>('dashboard');
   const [treasury, setTreasury] = useState<any>(null);
   const [policy, setPolicy] = useState<any>(null);
   const [approvals, setApprovals] = useState<any[]>([]);
   const [logs, setLogs] = useState<any[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
-  // Subscribe to session changes
-  useEffect(() => {
-    return subscribeSession((newSession) => {
-      setSession(newSession);
-    });
-  }, []);
+  setSecureFetch(secureFetch);
 
-  // Initial Load: Fetch users and initialize default session (Ari - Approver)
-  useEffect(() => {
-    const init = async () => {
-      try {
-        const userList = await api.getUsers();
-        setUsers(userList);
-
-        const savedUser = localStorage.getItem('leashed_user') || 'ari';
-        await loginAs(savedUser);
-      } catch (err) {
-        console.error('Initialization error:', err);
-      } finally {
-        setLoading(false);
-      }
-    };
-    init();
-  }, []);
-
-  // Fetch application state
-  const refreshData = async () => {
-    if (!session) return;
+  const refresh = useCallback(async () => {
     try {
-      const [tStatus, pol, apprs, lgs] = await Promise.all([
-        api.getTreasuryStatus().catch(() => null),
-        api.getPolicy().catch(() => null),
-        api.getApprovals().catch(() => []),
-        api.getAgentLogs().catch(() => [])
+      const [m, t, p, a, l] = await Promise.all([
+        api.me(), api.getTreasuryStatus(), api.getPolicy(), api.getApprovals(), api.getAgentLogs()
       ]);
-
-      if (tStatus) setTreasury(tStatus);
-      if (pol) setPolicy(pol);
-      if (apprs) setApprovals(apprs);
-      if (lgs) setLogs(lgs);
-    } catch (err) {
-      console.error('Error refreshing state:', err);
+      setMe(m); setTreasury(t); setPolicy(p); setApprovals(a); setLogs(l);
+      setError(null);
+    } catch (e: any) {
+      setError(e.message);
     }
-  };
+  }, []);
 
   useEffect(() => {
-    if (session) {
-      refreshData();
-    }
-  }, [session]);
+    refresh();
+    const t = setInterval(refresh, 4000);
+    return () => clearInterval(t);
+  }, [refresh]);
 
-  const handleSwitchUser = async (username: string) => {
-    await loginAs(username);
-    await refreshData();
-  };
-
-  const handleApprove = async (id: string) => {
-    await api.approveRequest(id);
-    await refreshData();
-  };
-
-  const handleReject = async (id: string, reason: string) => {
-    await api.rejectRequest(id, reason);
-    await refreshData();
-  };
-
-  const handleExecute = async (actionId: string, amount: number, payee: string, proof: string) => {
-    await api.executePayment(actionId, amount, payee, proof);
-    await refreshData();
-  };
-
-  if (loading) {
-    return (
-      <div style={{
-        minHeight: '100vh',
-        display: 'flex',
-        alignItems: 'center',
-        justifyContent: 'center',
-        backgroundColor: 'var(--bg-main)',
-        color: 'var(--text-muted)',
-        fontFamily: 'var(--font-sans)',
-        fontSize: '1rem'
-      }}>
-        Initializing Leashed Enclave & Verifying TideCloak Adapter...
-      </div>
-    );
-  }
+  const pending = approvals.filter((a) => a.status === 'PENDING').length;
+  const blocked = logs.filter((l) => l.status === 'BLOCKED').length;
+  const tabBtn = (id: typeof tab, label: string, Icon: typeof Lock, badge?: number) => (
+    <button
+      onClick={() => setTab(id)}
+      style={{
+        padding: '0.5rem 1rem', borderRadius: 8, border: 'none', fontSize: '0.85rem', fontWeight: 700,
+        display: 'flex', alignItems: 'center', gap: '0.5rem',
+        backgroundColor: tab === id ? 'var(--primary-blue)' : 'transparent',
+        color: tab === id ? '#fff' : 'var(--text-muted)'
+      }}
+    >
+      <Icon size={16} /> {label}
+      {!!badge && (
+        <span style={{ fontSize: '0.65rem', padding: '0.1rem 0.4rem', borderRadius: 9999, backgroundColor: 'var(--danger-red)', color: '#fff' }}>
+          {badge}
+        </span>
+      )}
+    </button>
+  );
 
   return (
     <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
-      {/* Navigation Header */}
-      <Header
-        users={users}
-        currentUser={session?.user || null}
-        onSelectUser={handleSwitchUser}
-      />
-
-      <main style={{
-        maxWidth: '1400px',
-        margin: '0 auto',
-        padding: '2rem',
-        width: '100%',
-        display: 'flex',
-        flexDirection: 'column',
-        gap: '2rem',
-        flex: 1
-      }}>
-        {/* Interactive Demo Control Bar */}
-        <DemoPanel
-          onRefreshAll={refreshData}
-          onSwitchUser={handleSwitchUser}
-        />
-
-        {/* Tab Navigation */}
-        <div style={{
-          display: 'flex',
-          alignItems: 'center',
-          gap: '0.75rem',
-          borderBottom: '1px solid var(--border-color)',
-          paddingBottom: '0.75rem'
-        }}>
-          <button
-            onClick={() => setActiveTab('dashboard')}
-            style={{
-              padding: '0.5rem 1rem',
-              borderRadius: '8px',
-              border: 'none',
-              backgroundColor: activeTab === 'dashboard' ? 'var(--primary-blue)' : 'transparent',
-              color: activeTab === 'dashboard' ? '#fff' : 'var(--text-muted)',
-              fontSize: '0.85rem',
-              fontWeight: 700,
-              display: 'flex',
-              alignItems: 'center',
-              gap: '0.5rem'
-            }}
-          >
-            <LayoutDashboard size={16} />
-            Treasury Dashboard
-          </button>
-
-          <button
-            onClick={() => setActiveTab('approvals')}
-            style={{
-              padding: '0.5rem 1rem',
-              borderRadius: '8px',
-              border: 'none',
-              backgroundColor: activeTab === 'approvals' ? 'var(--primary-blue)' : 'transparent',
-              color: activeTab === 'approvals' ? '#fff' : 'var(--text-muted)',
-              fontSize: '0.85rem',
-              fontWeight: 700,
-              display: 'flex',
-              alignItems: 'center',
-              gap: '0.5rem',
-              position: 'relative'
-            }}
-          >
-            <CheckSquare size={16} />
-            Approvals Queue
-            {approvals.filter((a) => a.status === 'PENDING').length > 0 && (
-              <span style={{
-                fontSize: '0.65rem',
-                padding: '0.1rem 0.4rem',
-                borderRadius: '9999px',
-                backgroundColor: 'var(--danger-red)',
-                color: '#fff',
-                marginLeft: '0.25rem'
-              }}>
-                {approvals.filter((a) => a.status === 'PENDING').length}
-              </span>
-            )}
-          </button>
-
-          <button
-            onClick={() => setActiveTab('logs')}
-            style={{
-              padding: '0.5rem 1rem',
-              borderRadius: '8px',
-              border: 'none',
-              backgroundColor: activeTab === 'logs' ? 'var(--primary-blue)' : 'transparent',
-              color: activeTab === 'logs' ? '#fff' : 'var(--text-muted)',
-              fontSize: '0.85rem',
-              fontWeight: 700,
-              display: 'flex',
-              alignItems: 'center',
-              gap: '0.5rem'
-            }}
-          >
-            <Terminal size={16} />
-            Quartermaster Audit Log
-            {logs.filter((l) => l.status === 'BLOCKED_BY_TIDECLOAK').length > 0 && (
-              <span style={{
-                fontSize: '0.65rem',
-                padding: '0.1rem 0.4rem',
-                borderRadius: '9999px',
-                backgroundColor: 'var(--danger-red)',
-                color: '#fff',
-                marginLeft: '0.25rem'
-              }}>
-                {logs.filter((l) => l.status === 'BLOCKED_BY_TIDECLOAK').length} Blocked
-              </span>
-            )}
-          </button>
+      <Header me={me} onLogout={logout} />
+      <main style={{ maxWidth: 1400, margin: '0 auto', padding: '2rem', width: '100%', display: 'flex', flexDirection: 'column', gap: '1.5rem', flex: 1 }}>
+        {error && (
+          <div style={{ padding: '0.75rem 1rem', borderRadius: 10, border: '1px solid var(--danger-red)', color: 'var(--danger-red)' }}>
+            API error: {error}
+          </div>
+        )}
+        <DemoPanel me={me} approvals={approvals} onRefresh={refresh} onShowApprovals={() => setTab('approvals')} />
+        <div style={{ display: 'flex', gap: '0.75rem', borderBottom: '1px solid var(--border-color)', paddingBottom: '0.75rem' }}>
+          {tabBtn('dashboard', 'Treasury', LayoutDashboard)}
+          {tabBtn('approvals', 'Approvals queue', CheckSquare, pending)}
+          {tabBtn('logs', 'Audit log', Terminal, blocked)}
         </div>
-
-        {/* Tab Views */}
-        {activeTab === 'dashboard' && (
-          <Dashboard
-            treasury={treasury}
-            policy={policy}
-            onNavigateToApprovals={() => setActiveTab('approvals')}
-            onNavigateToLogs={() => setActiveTab('logs')}
-          />
+        {tab === 'dashboard' && (
+          <Dashboard treasury={treasury} policy={policy} onNavigateToApprovals={() => setTab('approvals')} onNavigateToLogs={() => setTab('logs')} />
         )}
-
-        {activeTab === 'approvals' && (
-          <ApprovalsQueue
-            approvals={approvals}
-            currentUser={session?.user || null}
-            onApprove={handleApprove}
-            onReject={handleReject}
-            onExecute={handleExecute}
-            onRefresh={refreshData}
-          />
-        )}
-
-        {activeTab === 'logs' && (
-          <AgentLog
-            logs={logs}
-            onRefresh={refreshData}
-          />
-        )}
+        {tab === 'approvals' && <ApprovalsQueue approvals={approvals} me={me} onRefresh={refresh} />}
+        {tab === 'logs' && <AgentLog logs={logs} onRefresh={refresh} />}
       </main>
-
-      {/* Footer */}
-      <footer style={{
-        borderTop: '1px solid var(--border-color)',
-        padding: '1.25rem 2rem',
-        textAlign: 'center',
-        fontSize: '0.8rem',
-        color: 'var(--text-muted)',
-        backgroundColor: 'rgba(19, 27, 42, 0.5)'
-      }}>
-        <span>Leashed • UNLOCKED Hackathon (RMIT x Tide, Challenge 2) • Powered by </span>
-        <a
-          href="https://tide.org/tidecloak?utm_source=github&utm_medium=readme&utm_campaign=unlocked"
-          target="_blank"
-          rel="noreferrer"
-          style={{ color: 'var(--tide-cyan)', textDecoration: 'none', fontWeight: 600 }}
-        >
+      <footer style={{ borderTop: '1px solid var(--border-color)', padding: '1.25rem 2rem', textAlign: 'center', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+        Leashed • UNLOCKED (RMIT x Tide, Challenge 2) • Built with{' '}
+        <a href="https://tide.org/tidecloak?utm_source=github&utm_medium=readme&utm_campaign=unlocked" target="_blank" rel="noreferrer" style={{ color: 'var(--tide-cyan)' }}>
           TideCloak
         </a>
       </footer>

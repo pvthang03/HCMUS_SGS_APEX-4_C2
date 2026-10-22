@@ -1,286 +1,256 @@
-import express from 'express';
-import cors from 'cors';
-import { issueTideToken, generateDPoPProof, SEEDED_USERS } from './auth/tokenService.js';
+import express, { type Response } from 'express';
 import { withAuth, withRole, type AuthenticatedRequest } from './auth/protect.js';
-import { getPolicy, getRequiredApproval, updatePolicy } from './policy/policyEngine.js';
+import { loadTideConfig } from './auth/tidecloakConfig.js';
+import { hasRole } from './auth/tideJWT.js';
 import {
-  createApprovalRequest,
-  listApprovalRequests,
-  getApprovalRequest,
-  submitApproval,
-  rejectApproval
+  applyAmendment,
+  getAmendmentHistory,
+  getPolicy,
+  loadPolicy,
+  type Action,
+  type Policy
+} from './policy/policyEngine.js';
+import {
+  ApprovalError,
+  createProposal,
+  getProposal,
+  listProposals,
+  markExecuted,
+  publicView,
+  recordApproval,
+  rejectProposal
 } from './approvals/approvalManager.js';
-import { mockBank } from './treasury/mockBank.js';
-import { agentGateway, getAgentLogs, logAgentAction } from './agent/agentGateway.js';
+import { mockBank, BankRefusal } from './treasury/mockBank.js';
+import { getAgentLogs, logAction } from './agent/agentGateway.js';
 import { quartermasterAgent } from './agent/quartermaster.js';
 import seedData from './data/seed.json' with { type: 'json' };
 
-const app = express();
-const PORT = process.env.PORT || 3001;
+try {
+  process.loadEnvFile('.env');
+} catch {
+  // .env is optional; CLIENT_APP_URL falls back to http://localhost:5173
+}
 
-app.use(cors({ origin: true, credentials: true }));
+const app = express();
+const PORT = Number(process.env.PORT || 3001);
 app.use(express.json());
 
-// Public health check
-app.get('/api/health', (req, res) => {
+function fail(res: Response, e: any) {
+  const status = e instanceof ApprovalError ? e.status : e instanceof BankRefusal ? 403 : 400;
+  res.status(status).json({ error: e.name || 'Error', message: e.message, details: e.details });
+}
+
+app.get('/api/health', (_req, res) => {
+  const cfg = loadTideConfig();
+  res.json({ status: 'ONLINE', realm: cfg.realm, tidecloak: cfg['auth-server-url'], appUrl: process.env.CLIENT_APP_URL });
+});
+
+// Every route below verifies the TideCloak access token (realm VVK) and the DPoP proof.
+app.use('/api', withAuth);
+
+app.get('/api/me', (req: AuthenticatedRequest, res) => {
+  const u = req.user!;
   res.json({
-    status: 'ONLINE',
-    service: 'Leashed — Emergent Authority Guild Treasurer',
-    realm: 'leashed',
-    tidecloak: {
-      mode: 'Tide-Embedded-VVK',
-      senderConstrainedDPoP: 'RFC 9449 Strictly Enforced',
-      forsetiContract: 'LeashedTreasuryContract.cs'
-    },
-    timestamp: new Date().toISOString()
+    sub: u.id,
+    username: u.username,
+    role: u.role,
+    roles: ['approver', 'moderator', 'member'].filter((r) => hasRole(u.payload, r))
   });
 });
 
-// Seeded users list (public for demo persona switcher)
-app.get('/api/auth/users', (req, res) => {
-  res.json(Object.values(SEEDED_USERS));
+app.get('/api/policy', (_req, res) => {
+  res.json({ policy: getPolicy(), amendments: getAmendmentHistory() });
 });
 
-// Issue Tide access token for synthetic user (simulating Tide login)
-app.post('/api/auth/token', async (req, res) => {
-  try {
-    const { username } = req.body;
-    if (!username) {
-      return res.status(400).json({ error: 'Username is required' });
-    }
-    const session = await issueTideToken(username);
-    res.json(session);
-  } catch (err: any) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
-// Helper for client to obtain RFC 9449 DPoP proof for requests
-app.post('/api/auth/dpop-proof', async (req, res) => {
-  try {
-    const { username, method, url, accessToken } = req.body;
-    if (!username || !method || !url) {
-      return res.status(400).json({ error: 'Missing required parameters for DPoP proof' });
-    }
-    const proof = await generateDPoPProof(username, method, url, accessToken);
-    res.json({ proof });
-  } catch (err: any) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
-// ==========================================
-// PROTECTED ROUTES (Require JWT + DPoP)
-// ==========================================
-
-// Policy Information
-app.get('/api/policy', withAuth, (req: AuthenticatedRequest, res) => {
-  res.json(getPolicy());
-});
-
-// Treasury status
-app.get('/api/treasury/status', withAuth, (req: AuthenticatedRequest, res) => {
+app.get('/api/treasury/status', (_req, res) => {
   res.json({
     balance: mockBank.getBalance(),
     currency: 'CREDITS',
     transactions: mockBank.getTransactions(),
     vendors: seedData.vendors,
-    unprocessedInvoices: seedData.invoices
+    invoices: seedData.invoices
   });
 });
 
-// Execute Payment: Only succeeds if presented with Tide-signed VVK authorization ticket!
-app.post('/api/treasury/execute', withAuth, async (req: AuthenticatedRequest, res) => {
+app.get('/api/approvals', (_req, res) => {
+  res.json(listProposals());
+});
+
+// The approve request itself is the evidence: its token + DPoP proof sign this exact URL.
+app.post('/api/approvals/:id/approve/:digest', async (req: AuthenticatedRequest, res) => {
+  const u = req.user!;
   try {
-    const { actionId, amount, payee, authorizationProof } = req.body;
-
-    if (!actionId || amount === undefined || !payee) {
-      return res.status(400).json({ error: 'Missing action details' });
-    }
-
-    const result = await mockBank.executePayment(actionId, amount, payee, authorizationProof);
-    res.json(result);
-  } catch (err: any) {
-    res.status(403).json({
-      error: 'TideCloak Enforcement Refusal',
-      message: err.message
+    const p = await recordApproval(String(req.params.id), String(req.params.digest), {
+      accessToken: u.token,
+      dpopProof: u.dpopProof
     });
+    res.json(publicView(p));
+  } catch (e: any) {
+    logAction({
+      actor: u.username,
+      tool: 'approve',
+      actionSummary: `${u.username} (${u.role}) tried to approve ${String(req.params.id)} → REFUSED`,
+      status: 'BLOCKED',
+      enforcedBy: 'Approval evidence verifier (Tide token roles)',
+      details: { reason: e.message }
+    });
+    fail(res, e);
   }
 });
 
-// Rogue Admin Attack Attempt 1: Direct bank call without VVK proof
-app.post('/api/treasury/admin-bypass-attempt', withAuth, withRole('admin'), async (req: AuthenticatedRequest, res) => {
-  logAgentAction(
-    'admin_direct_payment_attempt',
-    `ROGUE ADMIN ATTEMPT: Admin '${req.user?.username}' attempted direct bank payment of 500 credits without quorum!`,
-    'BLOCKED_BY_TIDECLOAK',
+app.post('/api/approvals/:id/reject', withRole('approver'), (req: AuthenticatedRequest, res) => {
+  try {
+    res.json(publicView(rejectProposal(String(req.params.id), req.user!.username, req.body?.reason)));
+  } catch (e) {
+    fail(res, e);
+  }
+});
+
+// Anyone may ask for execution. Authority comes only from the evidence, which is re-verified.
+app.post('/api/approvals/:id/execute', async (req: AuthenticatedRequest, res) => {
+  const p = getProposal(String(req.params.id));
+  if (!p) return res.status(404).json({ message: 'Proposal not found.' });
+  if (p.status !== 'PENDING') return res.status(409).json({ message: `Proposal is ${p.status}.` });
+  try {
+    const result =
+      p.action.kind === 'PAYMENT'
+        ? await mockBank.execute(p.action, p.evidence)
+        : { policyVersion: p.action.newPolicy.version, approvers: (await applyAmendment({ action: p.action, evidence: p.evidence })).map((a) => a.username) };
+    markExecuted(p, result);
+    logAction({
+      actor: req.user!.username,
+      tool: 'execute',
+      actionSummary: `Executed ${p.id} (${p.evaluation.tierName}) with ${p.approvals.length} Tide-signed approval(s)`,
+      status: 'EXECUTED',
+      tier: p.evaluation.tier,
+      enforcedBy: p.action.kind === 'PAYMENT' ? 'Bank verifier' : 'Policy store verifier',
+      details: result
+    });
+    res.json(publicView(p));
+  } catch (e: any) {
+    logAction({
+      actor: req.user!.username,
+      tool: 'execute',
+      actionSummary: `Execution of ${p.id} refused`,
+      status: 'BLOCKED',
+      tier: p.evaluation.tier,
+      enforcedBy: p.action.kind === 'PAYMENT' ? 'Bank verifier' : 'Policy store verifier',
+      details: { reason: e.message, ...(e.details || {}) }
+    });
+    fail(res, e);
+  }
+});
+
+// Raw bank access for anyone holding a session: what a rogue admin would call directly.
+app.post('/api/treasury/execute', async (req: AuthenticatedRequest, res) => {
+  try {
+    res.json(await mockBank.execute(req.body?.action as Action, req.body?.evidence || []));
+  } catch (e) {
+    fail(res, e);
+  }
+});
+
+app.post('/api/policy/propose', (req: AuthenticatedRequest, res) => {
+  const u = req.user!;
+  const current = getPolicy();
+  const limit = Number(req.body?.tier1MaxAmountExclusive);
+  if (!Number.isFinite(limit) || limit <= 0) return res.status(400).json({ message: 'tier1MaxAmountExclusive must be > 0' });
+  const newPolicy: Policy = structuredClone(current);
+  newPolicy.version = current.version + 1;
+  newPolicy.name = `Leashed Treasury Policy v${newPolicy.version}`;
+  newPolicy.tiers['1'].maxAmountExclusive = limit;
+  const p = createProposal(
     {
-      actor: req.user?.username,
-      role: req.user?.role,
-      attemptedAction: 'Direct bank payout without TideCloak VVK authorization proof'
+      kind: 'CHANGE_POLICY',
+      basePolicyVersion: current.version,
+      newPolicy,
+      summary: `Tier 1 limit ${current.tiers['1'].maxAmountExclusive} → ${limit} credits`
     },
-    2
+    { kind: 'user', username: u.username, sub: u.id }
   );
-
-  return res.status(403).json({
-    error: 'TideCloak Enforcement Refusal',
-    blockedByTide: true,
-    message: 'BLOCKED BY TIDECLOAK: The Mock Bank requires a cryptographic authorization ticket signed by the Tide Realm VVK key. Even a Guild Admin / Moderator holds zero keys to move funds unilaterally.'
+  logAction({
+    actor: u.username,
+    tool: 'propose_policy_change',
+    actionSummary: `${u.username} proposed: Tier 1 limit → ${limit} credits (needs ${p.evaluation.requiredApprovers} approvals)`,
+    status: 'PROPOSAL_SUBMITTED',
+    tier: 3,
+    details: { proposalId: p.id }
   });
+  res.json(publicView(p));
 });
 
-// Approvals Queue
-app.get('/api/approvals', withAuth, (req: AuthenticatedRequest, res) => {
-  const { status } = req.query;
-  res.json(listApprovalRequests(status as string));
-});
+/**
+ * Rogue-moderator scenario. Each attempt goes through the real code path with the caller's
+ * own credentials; the responses below are whatever the verifiers actually said.
+ */
+app.post('/api/attacks/rogue-admin', async (req: AuthenticatedRequest, res) => {
+  const u = req.user!;
+  const ownEvidence = [{ accessToken: u.token, dpopProof: u.dpopProof }];
+  const attempts: Array<{ attempt: string; blocked: boolean; reason: string }> = [];
 
-// Approver signs request
-app.post('/api/approvals/:id/approve', withAuth, async (req: AuthenticatedRequest, res) => {
-  try {
-    const { id } = req.params;
-    const user = req.user!;
-
-    // Invariant: Only 'approver' role can sign! Admin alone or agent cannot sign!
-    if (user.role !== 'approver') {
-      logAgentAction(
-        'unauthorized_approval_attempt',
-        `UNAUTHORIZED APPROVAL: User '${user.username}' with role '${user.role}' attempted to approve request '${id}'!`,
-        'BLOCKED_BY_TIDECLOAK',
-        { actor: user.username, role: user.role, requestId: id },
-        2
-      );
-      return res.status(403).json({
-        error: 'Forbidden',
-        message: `Role '${user.role}' cannot act as a financial approver. Only members of the approver council holding the 'approver' role may sign.`
-      });
-    }
-
-    const result = await submitApproval(id, {
-      id: user.id,
-      username: user.username,
-      role: user.role
+  const record = (attempt: string, blocked: boolean, reason: string) => {
+    attempts.push({ attempt, blocked, reason });
+    logAction({
+      actor: u.username,
+      tool: 'rogue_admin',
+      actionSummary: `${attempt} → ${blocked ? 'REFUSED' : 'ALLOWED'}`,
+      status: blocked ? 'BLOCKED' : 'EXECUTED',
+      enforcedBy: attempt.startsWith('Lower') ? 'Policy store verifier' : 'Bank verifier',
+      details: { reason }
     });
+  };
 
-    res.json(result);
-  } catch (err: any) {
-    res.status(400).json({ error: err.message });
-  }
-});
-
-// Approver rejects request
-app.post('/api/approvals/:id/reject', withAuth, async (req: AuthenticatedRequest, res) => {
   try {
-    const { id } = req.params;
-    const { reason } = req.body;
-    const user = req.user!;
-
-    const result = rejectApproval(
-      id,
-      { id: user.id, username: user.username, role: user.role },
-      reason
+    const tx = await mockBank.execute(
+      { kind: 'PAYMENT', proposalId: 'admin-direct', nonce: 'admin-' + Date.now(), invoiceId: 'none', amount: 500, payee: u.username },
+      ownEvidence
     );
-    res.json(result);
-  } catch (err: any) {
-    res.status(400).json({ error: err.message });
+    record('Call the bank directly: pay 500 credits to myself', false, `settled ${tx.id}`);
+  } catch (e: any) {
+    record('Call the bank directly: pay 500 credits to myself', true, e.message);
   }
+
+  try {
+    const current = getPolicy();
+    const newPolicy: Policy = structuredClone(current);
+    newPolicy.version = current.version + 1;
+    newPolicy.tiers['1'].maxAmountExclusive = 1000;
+    await applyAmendment({
+      action: {
+        kind: 'CHANGE_POLICY',
+        proposalId: 'admin-direct-policy',
+        nonce: 'admin-' + Date.now(),
+        basePolicyVersion: current.version,
+        newPolicy,
+        summary: 'Tier 1 limit → 1000'
+      },
+      evidence: ownEvidence
+    });
+    record('Lower the Tier 1 limit to 1000 credits without the council', false, 'policy changed');
+  } catch (e: any) {
+    record('Lower the Tier 1 limit to 1000 credits without the council', true, e.message);
+  }
+
+  res.json({ actor: u.username, role: u.role, attempts });
 });
 
-// Rogue Admin Attack Attempt 2: Policy weakening attempt
-app.post('/api/policy/admin-override-attempt', withAuth, withRole('admin'), (req: AuthenticatedRequest, res) => {
-  logAgentAction(
-    'admin_policy_weakening_attempt',
-    `ROGUE ADMIN ATTEMPT: Admin '${req.user?.username}' attempted to unilaterally raise Tier 1 limit to 1000 credits!`,
-    'BLOCKED_BY_TIDECLOAK',
-    {
-      actor: req.user?.username,
-      role: req.user?.role,
-      attemptedAction: 'Unilateral policy threshold weakening without 3-of-3 quorum'
-    },
-    3
-  );
-
-  return res.status(403).json({
-    error: 'TideCloak Enforcement Refusal',
-    blockedByTide: true,
-    message: 'BLOCKED BY TIDECLOAK: Policy amendments are Tier 3 constitutional actions requiring a 3-of-3 human approver quorum. Admin cannot weaken policies alone.'
-  });
-});
-
-// Agent Audit Logs
-app.get('/api/agent/logs', withAuth, (req: AuthenticatedRequest, res) => {
+app.get('/api/agent/logs', (_req, res) => {
   res.json(getAgentLogs());
 });
 
-// Demo Scenario 1: Normal Work
-app.post('/api/agent/run-scenario-1', withAuth, async (req: AuthenticatedRequest, res) => {
+app.post('/api/agent/run/:scenario', async (req, res) => {
   try {
-    const result = await quartermasterAgent.runNormalWorkScenario();
-    res.json(result);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
+    const s = req.params.scenario;
+    if (s === 'normal') return res.json(quartermasterAgent.runNormalWork());
+    if (s === 'poisoned') return res.json(await quartermasterAgent.runPoisonedInvoice());
+    if (s === 'quorum') return res.json(quartermasterAgent.runQuorumPayment());
+    res.status(404).json({ message: 'Unknown scenario' });
+  } catch (e: any) {
+    res.status(500).json({ message: e.message });
   }
 });
 
-// Demo Scenario 2: The Attack (Poisoned Invoice Injection)
-app.post('/api/agent/run-scenario-2', withAuth, async (req: AuthenticatedRequest, res) => {
-  try {
-    const result = await quartermasterAgent.runPoisonedInvoiceScenario();
-    res.json(result);
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
-// Demo Scenario 3: The Rogue Admin Attacks
-app.post('/api/agent/run-scenario-3', withAuth, async (req: AuthenticatedRequest, res) => {
-  try {
-    // 1. Log attempt 1: Admin tries to approve alone -> fails
-    logAgentAction(
-      'admin_solo_approval_attempt',
-      "ROGUE ADMIN ATTEMPT 1: Admin tried to unilaterally approve 900-credit transfer -> REFUSED (Role 'admin' != 'approver')",
-      'BLOCKED_BY_TIDECLOAK',
-      { actor: 'admin', role: 'admin', attemptedAction: 'Unilateral approval' },
-      2
-    );
-
-    // 2. Log attempt 2: Admin tries to raise threshold to 1000 -> fails
-    logAgentAction(
-      'admin_policy_override_attempt',
-      'ROGUE ADMIN ATTEMPT 2: Admin tried to weaken policy threshold to 1000 credits -> REFUSED (Requires 3-of-3 quorum)',
-      'BLOCKED_BY_TIDECLOAK',
-      { actor: 'admin', role: 'admin', attemptedAction: 'Policy override' },
-      3
-    );
-
-    // 3. Log attempt 3: Admin tries to call bank directly -> fails
-    logAgentAction(
-      'admin_bank_bypass_attempt',
-      'ROGUE ADMIN ATTEMPT 3: Admin called /api/treasury/execute directly -> REFUSED (Missing VVK Authorization Proof)',
-      'BLOCKED_BY_TIDECLOAK',
-      { actor: 'admin', role: 'admin', attemptedAction: 'Direct bank payout' },
-      2
-    );
-
-    // 4. Create legitimate 80-credit payment proposal for approved vendor Neural Creative Assets
-    const legitimateProposal = await agentGateway.draftPaymentProposal(
-      'INV-2026-02',
-      80,
-      'Neural Creative Assets',
-      'Quarterly brand package & UI assets'
-    );
-
-    res.json({
-      scenario: 'SCENARIO_3_ROGUE_ADMIN',
-      summary: 'All 3 rogue admin bypass attempts were BLOCKED BY TIDECLOAK. A legitimate 80-credit payment proposal was submitted to the council queue requiring 2-of-3 approvers.',
-      legitimateProposal
-    });
-  } catch (err: any) {
-    res.status(500).json({ error: err.message });
-  }
-});
-
+await loadPolicy();
 app.listen(PORT, () => {
-  console.log(`[Leashed Server] Listening on http://localhost:${PORT}`);
-  console.log(`[Leashed Server] TideCloak VVK Auth & RFC 9449 DPoP protection active`);
+  console.log(`[Leashed] API on http://localhost:${PORT} — TideCloak ${loadTideConfig()['auth-server-url']}`);
 });

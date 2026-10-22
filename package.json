@@ -2,17 +2,20 @@
   "name": "leashed",
   "version": "1.0.0",
   "private": true,
-  "description": "Leashed — an AI treasurer with no master key, powered by TideCloak",
+  "description": "Leashed: an AI treasurer that cannot move money alone. Approvals are Tide-signed; the bank re-verifies them.",
   "type": "module",
   "scripts": {
+    "tide:bootstrap": "ADAPTER_OUTPUT=data/tidecloak.json bash scripts/bootstrap-tidecloak.sh && cp data/tidecloak.json public/tidecloak.json",
+    "tide:seed": "bash scripts/seed-leashed-realm.sh",
     "dev": "concurrently -k -p \"[{name}]\" -n \"SERVER,CLIENT\" -c \"blue,green\" \"npm run server\" \"npm run client\"",
     "server": "tsx server/index.ts",
-    "client": "vite --port 5173",
+    "client": "vite --port 5173 --host",
     "build": "vite build",
     "test": "tsx server/tests/verification.ts",
-    "lint": "echo 'Checking syntax' && tsc --noEmit"
+    "lint": "tsc --noEmit"
   },
   "dependencies": {
+    "@tidecloak/react": "0.14.17",
     "cors": "^2.8.5",
     "express": "^4.21.2",
     "jose": "^5.9.6",

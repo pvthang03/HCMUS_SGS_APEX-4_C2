@@ -12,3 +12,8 @@ build/
 
 # Tide state
 data/keycloakdb*
+
+# Per-environment TideCloak adapter (exported by the bootstrap) and runtime state
+data/tidecloak.json
+public/tidecloak.json
+data/state/

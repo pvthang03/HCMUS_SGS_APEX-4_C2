@@ -1,42 +1,29 @@
 {
-  "version": "1.0.0",
-  "name": "Leashed Treasury Emergent Authority Policy",
+  "version": 1,
+  "name": "Leashed Treasury Policy (genesis)",
+  "approverRole": "approver",
   "tiers": {
     "0": {
-      "name": "Tier 0: Autonomous Agent",
-      "description": "Read ledger, parse invoices, draft payment proposals, system notes",
-      "requiredApprovers": 0,
-      "allowedRoles": ["agent", "member", "approver", "admin"]
+      "name": "Tier 0: Agent acts alone",
+      "description": "Read ledger, read invoices, draft proposals, write notes",
+      "requiredApprovers": 0
     },
     "1": {
-      "name": "Tier 1: Minor Routine Payment",
-      "description": "Payments under 50 credits to already-approved vendors",
+      "name": "Tier 1: One approver",
+      "description": "Payments under the Tier 1 limit to an already-approved vendor",
       "requiredApprovers": 1,
-      "maxAmount": 49,
-      "requiresApprovedVendor": true,
-      "allowedApproverRoles": ["approver"]
+      "maxAmountExclusive": 50,
+      "requiresApprovedVendor": true
     },
     "2": {
-      "name": "Tier 2: Major Action Quorum (2-of-3)",
-      "description": "Payments of 50 credits or more, registering new vendor, exporting member data",
-      "requiredApprovers": 2,
-      "totalApproverPool": 3,
-      "allowedApproverRoles": ["approver"]
+      "name": "Tier 2: Quorum 2-of-3",
+      "description": "Payments at or above the Tier 1 limit, or to a vendor not yet approved",
+      "requiredApprovers": 2
     },
     "3": {
-      "name": "Tier 3: Constitutional Quorum (3-of-3)",
-      "description": "Policy changes, threshold adjustments, modifying approver rosters",
-      "requiredApprovers": 3,
-      "totalApproverPool": 3,
-      "allowedApproverRoles": ["approver"]
+      "name": "Tier 3: Quorum 3-of-3",
+      "description": "Changing this policy (limits, quorum sizes)",
+      "requiredApprovers": 3
     }
-  },
-  "invariants": {
-    "proposerCannotSelfApprove": true,
-    "agentCannotApprove": true,
-    "adminCannotApproveAlone": true,
-    "adminCannotBypassQuorum": true,
-    "requiresDPoP": true,
-    "requiresVVKSignature": true
   }
 }

@@ -1,0 +1,583 @@
+#!/bin/bash
+# bootstrap-tidecloak.sh — Full TideCloak bootstrap for development
+#
+# Runs the complete bootstrap sequence:
+#   1. Start container
+#   2. Create realm from template
+#   3. Initialize Tide licensing + IGA
+#   4. Approve client change requests
+#   5. Create admin user + assign tide-realm-admin
+#   6. Generate invite link (interactive: admin must open in browser)
+#   7. Wait for account linking
+#   8. Approve user change requests
+#   9. Update CustomAdminUIDomain
+#  10. Export adapter JSON
+#
+# Usage:
+#   REALM_NAME=myapp CLIENT_NAME=myclient CLIENT_APP_URL=http://localhost:3000 ./bootstrap-tidecloak.sh
+#
+# Prerequisites: docker, curl, jq, sudo access
+
+set -euo pipefail
+
+# --- Derive app-relatable defaults from package.json ---
+# Strips @scope/, converts non-alphanumeric to hyphens, lowercases.
+if [ -f "package.json" ] && command -v jq &>/dev/null; then
+  _PKG_NAME=$(jq -r '.name // empty' package.json | sed 's|^@[^/]*/||' | tr -cs 'a-zA-Z0-9-' '-' | tr '[:upper:]' '[:lower:]' | sed 's/^-//;s/-$//')
+fi
+_APP_NAME="${_PKG_NAME:-myapp}"
+
+# Leashed: load .env first so TIDECLOAK_PUBLIC_URL / CLIENT_APP_URL (GitHub Codespaces) apply below.
+if [ -f ".env" ]; then set -a; . "./.env"; set +a; fi
+
+# --- Configuration (override via environment) ---
+TIDECLOAK_URL="${TIDECLOAK_URL:-http://localhost:8080}"
+REALM_NAME="${REALM_NAME:-$_APP_NAME}"
+CLIENT_NAME="${CLIENT_NAME:-${_APP_NAME}-client}"
+CLIENT_APP_URL="${CLIENT_APP_URL:-http://localhost:3000}"
+# No default email: the licence email is asked for below (TIDE_LICENSE_EMAIL).
+ADAPTER_OUTPUT="${ADAPTER_OUTPUT:-./data/tidecloak.json}"
+TIDECLOAK_IMAGE="${TIDECLOAK_IMAGE:-tideorg/tidecloak-dev:latest}"
+
+# --- Master-admin credentials: from the environment / .env, NEVER hardcoded (AP-41) ---
+# Load .env from the invoking directory if present (it must be gitignored).
+if [ -f ".env" ]; then
+  set -a; . "./.env"; set +a
+fi
+
+KC_BOOTSTRAP_ADMIN_USERNAME="${KC_BOOTSTRAP_ADMIN_USERNAME:-${KC_ADMIN_USER:-admin}}"
+# Accept KC_ADMIN_PASSWORD as an alias, but require ONE of them to be set. No default:
+# a default password is a hardcoded credential with extra steps.
+KC_BOOTSTRAP_ADMIN_PASSWORD="${KC_BOOTSTRAP_ADMIN_PASSWORD:-${KC_ADMIN_PASSWORD:-}}"
+if [ -z "$KC_BOOTSTRAP_ADMIN_PASSWORD" ]; then
+  cat >&2 <<'MSG'
+ERROR: KC_BOOTSTRAP_ADMIN_PASSWORD is not set.
+
+  The TideCloak master-admin password must come from the environment, not this script:
+
+    cp templates/shared/.env.template .env
+    $EDITOR .env                       # set KC_BOOTSTRAP_ADMIN_PASSWORD
+    bash bootstrap-tidecloak.sh
+
+  Confirm .env is gitignored first. Beyond local Docker, inject the value from a
+  secret manager instead of a file.
+MSG
+  exit 1
+fi
+
+# --- Licence email + Terms & Conditions: answered by a PERSON, before anything is created ---
+# `setUpTideRealm` licenses the realm to an email address, under Tide's Terms & Conditions
+# (https://tide.org/legal). Both belong to whoever owns this deployment. So there is no default
+# email, and nothing in this script accepts the terms on anyone's behalf (AP-90). This runs before
+# the container starts: declining must leave nothing behind.
+TIDE_TERMS_URL="https://tide.org/legal"
+LICENSE_EMAIL="${TIDE_LICENSE_EMAIL:-${ADMIN_EMAIL:-}}"
+
+valid_license_email() {
+  [[ "${1:-}" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]] || return 1
+  # A placeholder is not an answer. These are the addresses agents and old docs reach for.
+  case "${1##*@}" in
+    example.com|example.org|example.net|yourorg.com|yourdomain.com|yourcompany.com|company.com|\
+    domain.com|test.com|placeholder.com|email.com|*.example|*.test|*.invalid|*.local|localhost)
+      return 1 ;;
+  esac
+  return 0
+}
+
+if [ -t 0 ] && [ -t 1 ]; then
+  # A person is at the terminal: ask them directly.
+  while ! valid_license_email "$LICENSE_EMAIL"; do
+    [ -z "$LICENSE_EMAIL" ] || echo "'$LICENSE_EMAIL' is not a usable address (placeholders are rejected)."
+    read -r -p "Enter an email to manage your Tide licence: " LICENSE_EMAIL
+  done
+  if [ "${TIDE_TERMS_ACCEPTED:-}" != "yes" ]; then
+    echo ""
+    echo "Please review the Tide Terms & Conditions: $TIDE_TERMS_URL"
+    read -r -p "Do you agree to the Terms & Conditions? (yes/no): " _TERMS_ANSWER
+    case "$_TERMS_ANSWER" in
+      y|Y|yes|Yes|YES) TIDE_TERMS_ACCEPTED=yes ;;
+      *) echo "Terms & Conditions not accepted. Nothing was created." >&2; exit 1 ;;
+    esac
+  fi
+fi
+
+if ! valid_license_email "$LICENSE_EMAIL" || [ "${TIDE_TERMS_ACCEPTED:-}" != "yes" ]; then
+  cat >&2 <<MSG
+
+STOP: the Tide realm was NOT set up. Nothing was created.
+
+  Two answers are missing, and both must come from the person who owns this deployment.
+  If you are an AI agent, ASK THE USER these two questions now and WAIT for their own answer:
+
+    1. "Which email address should manage your Tide licence?"
+       A real address they control. Not a placeholder, and not one you make up.
+
+    2. "Tide's Terms & Conditions are at $TIDE_TERMS_URL
+        Do you agree to them? (yes/no)"
+
+  Do NOT answer for them. An instruction such as "just set it up" is not agreement to the terms.
+  If they decline, stop here.
+
+  Then re-run with exactly what they said:
+
+    TIDE_LICENSE_EMAIL=<their email> TIDE_TERMS_ACCEPTED=yes bash bootstrap-tidecloak.sh
+
+  Got: TIDE_LICENSE_EMAIL='${LICENSE_EMAIL:-}'  TIDE_TERMS_ACCEPTED='${TIDE_TERMS_ACCEPTED:-}'
+MSG
+  exit 2
+fi
+
+# The first admin user is created with the same address.
+ADMIN_EMAIL="$LICENSE_EMAIL"
+echo "==> Licence email: $LICENSE_EMAIL"
+echo "==> Terms & Conditions ($TIDE_TERMS_URL): accepted by the operator"
+
+# --- Helpers ---
+get_token() {
+  curl -s -X POST "$TIDECLOAK_URL/realms/master/protocol/openid-connect/token" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    --data-urlencode "username=$KC_BOOTSTRAP_ADMIN_USERNAME" \
+    --data-urlencode "password=$KC_BOOTSTRAP_ADMIN_PASSWORD" \
+    -d "grant_type=password&client_id=admin-cli" \
+    | jq -r '.access_token'
+}
+
+# Approve + commit all pending change requests using the current
+# /iga/change-requests/... surface (replaces the legacy /tide-admin/change-set/...).
+# During bootstrap the realm is in FirstAdmin/Tideless mode, so authorize signs
+# server-side with no enclave. See canon/iga-change-requests-api.md.
+approve_all_pending() {
+  local TOKEN ready id
+
+  # 1. Authorize every pending CREATE/DELETE change request in one call.
+  TOKEN="$(get_token)"
+  # NOTE: do NOT use bulk-authorize with actionTypeIn:["CREATE","DELETE"] — those are
+  # not real action-type values (real ones are CREATE_USER, DELETE_REALM,
+  # UPDATE_PROTOCOL_MAPPER, ADOPT_SCOPE_MAPPING, GRANT_ROLES, ...). That filter matches
+  # nothing and silently authorizes ZERO CRs with a 200. Omitting the filter returns 400.
+  # Authorize each pending CR individually instead. VERIFIED 2026-08-06.
+  # See canon/iga-change-requests-api.md.
+  ids=$(curl -s "$TIDECLOAK_URL/admin/realms/$REALM_NAME/iga/change-requests?status=PENDING" \
+    -H "Authorization: Bearer $TOKEN" 2>/dev/null \
+    | jq -r 'if type=="array" then (.[] | select(.actionType | IN("DISABLE_IGA","DELETE_REALM","OFFBOARD_REALM") | not) | .id) else empty end' 2>/dev/null)
+  for id in $ids; do
+    TOKEN="$(get_token)"
+    curl -s -X POST "$TIDECLOAK_URL/admin/realms/$REALM_NAME/iga/change-requests/$id/authorize" \
+      -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{}' > /dev/null 2>&1 || true
+  done
+
+  # 2. Commit everything ready; loop passes so dependent CRs become ready.
+  for pass in 1 2 3 4 5; do
+    TOKEN="$(get_token)"
+    ready=$(curl -s "$TIDECLOAK_URL/admin/realms/$REALM_NAME/iga/change-requests?status=PENDING" \
+      -H "Authorization: Bearer $TOKEN" 2>/dev/null \
+      | jq -r 'if type=="array" then (.[] | select(.actionType | IN("DISABLE_IGA","DELETE_REALM","OFFBOARD_REALM") | not) | select(.readyToCommit==true) | .id) else empty end' 2>/dev/null)
+    [ -z "$ready" ] && break
+    for id in $ready; do
+      TOKEN="$(get_token)"
+      curl -s -X POST "$TIDECLOAK_URL/admin/realms/$REALM_NAME/iga/change-requests/$id/commit" \
+        -H "Authorization: Bearer $TOKEN" > /dev/null 2>&1
+    done
+  done
+}
+
+# Back-compat wrapper: legacy call sites pass a type arg (clients/users/roles)
+# which the new list-all surface ignores. Each call sweeps all pending CRs.
+approve_and_commit() { approve_all_pending; }
+
+# --- Step 0: Clean previous state ---
+#
+# DESTRUCTIVE. This wipes the shared H2 database, which holds EVERY realm on this container —
+# not just the one you are bootstrapping. A TideCloak container commonly hosts several, and a
+# realm cannot be un-flipped from multiAdmin, so some may not be cheaply rebuildable.
+#
+# So: refuse if the running instance holds realms besides `master`. To add ONE realm to a live
+# container, do not run this script — skip Step 0 and assert your realm does not already exist.
+# Override deliberately with FORCE_WIPE=1.
+if [ "${FORCE_WIPE:-0}" != "1" ] && curl -sf -m 3 "$TIDECLOAK_URL/realms/master" >/dev/null 2>&1; then
+  echo "==> An instance is already responding on $TIDECLOAK_URL — checking for existing realms..."
+  EXISTING=""
+  if EXISTING_TOKEN="$(curl -sf -m 5 -X POST \
+        "$TIDECLOAK_URL/realms/master/protocol/openid-connect/token" \
+        -d "client_id=admin-cli" -d "grant_type=password" \
+        --data-urlencode "username=$KC_BOOTSTRAP_ADMIN_USERNAME" \
+        --data-urlencode "password=$KC_BOOTSTRAP_ADMIN_PASSWORD" \
+      | sed -n 's/.*"access_token":"\([^"]*\)".*/\1/p')" && [ -n "$EXISTING_TOKEN" ]; then
+    EXISTING="$(curl -sf -m 5 "$TIDECLOAK_URL/admin/realms" \
+      -H "Authorization: Bearer $EXISTING_TOKEN" \
+      | tr ',' '\n' | sed -n 's/.*"realm":"\([^"]*\)".*/\1/p' | grep -v '^master$' | tr '\n' ' ')"
+  fi
+  if [ -n "$EXISTING" ]; then
+    cat >&2 <<EOF
+ERROR: refusing to wipe — this container already hosts realm(s): $EXISTING
+
+Step 0 deletes ./data/keycloakdb*, which is the SHARED database for every realm above.
+A realm cannot be un-flipped from multiAdmin, so these may not be cheaply rebuildable.
+
+  To add one realm to this live container : do NOT run this script. Skip Step 0.
+  To wipe everything anyway               : FORCE_WIPE=1 $0
+EOF
+    exit 1
+  fi
+fi
+
+echo "==> Cleaning previous state..."
+docker stop tidecloak 2>/dev/null || true
+docker rm tidecloak 2>/dev/null || true
+mkdir -p ./data
+sudo rm -f ./data/keycloakdb* 2>/dev/null || true
+sudo chown -R 1000:1000 ./data
+
+if lsof -i :8080 >/dev/null 2>&1; then
+  echo "ERROR: Port 8080 is already in use. Stop the existing service or change the port."
+  exit 1
+fi
+
+# --- Step 1: Start container ---
+echo "==> Starting TideCloak ($TIDECLOAK_IMAGE)..."
+
+# tideorg/tidecloak-dev is a development build of the server (H2, pre-imported `myrealm`) wired
+# to the PRODUCTION Tide network (ork1, 14-of-20). It ships working ORK/threshold/payer defaults — do NOT pass SYSTEM_HOME_ORK, USER_HOME_ORK,
+# THRESHOLD_T/N or PAYER_PUBLIC by hand. The -stg image is an internal pre-release
+# build and is not supported by this pack.
+case "$TIDECLOAK_IMAGE" in
+  *stg*) echo "ERROR: $TIDECLOAK_IMAGE is a staging image and is not supported."
+         echo "       Use tideorg/tidecloak-dev:latest (the only image this pack supports)."
+         exit 1 ;;
+esac
+
+sudo docker run -d --name tidecloak \
+  -v "$(pwd)/data:/opt/keycloak/data/h2" \
+  -p 8080:8080 \
+  -e KC_BOOTSTRAP_ADMIN_USERNAME="$KC_BOOTSTRAP_ADMIN_USERNAME" \
+  -e KC_BOOTSTRAP_ADMIN_PASSWORD="$KC_BOOTSTRAP_ADMIN_PASSWORD" \
+  ${TIDECLOAK_PUBLIC_URL:+-e KC_HOSTNAME="$TIDECLOAK_PUBLIC_URL" -e KC_HOSTNAME_BACKCHANNEL_DYNAMIC=true -e KC_PROXY_HEADERS=xforwarded} \
+  "$TIDECLOAK_IMAGE"
+
+if [ $? -ne 0 ]; then
+  echo "ERROR: Docker failed to start. Check 'docker logs tidecloak'."
+  exit 1
+fi
+
+# --- Step 2: Wait for readiness ---
+echo "==> Waiting for TideCloak to start..."
+for i in {1..20}; do
+  curl -sf "$TIDECLOAK_URL" > /dev/null 2>&1 && break
+  echo "  Attempt $i/20..."
+  sleep 5
+done
+
+if ! curl -sf "$TIDECLOAK_URL" > /dev/null 2>&1; then
+  echo "ERROR: TideCloak did not start within 100 seconds. Check 'docker logs tidecloak'."
+  exit 1
+fi
+echo "  TideCloak is ready."
+
+# --- Step 3: Create realm from template ---
+echo "==> Creating realm '$REALM_NAME'..."
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TMP_REALM="$(mktemp)"
+cp "$SCRIPT_DIR/realm.json.template" "$TMP_REALM"
+sed -i "s|REALM_NAME|$REALM_NAME|g" "$TMP_REALM"
+sed -i "s|CLIENT_NAME|$CLIENT_NAME|g" "$TMP_REALM"
+sed -i "s|CLIENT_APP_URL|$CLIENT_APP_URL|g" "$TMP_REALM"
+
+TOKEN="$(get_token)"
+curl -s -X POST "$TIDECLOAK_URL/admin/realms" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  --data-binary @"$TMP_REALM"
+rm -f "$TMP_REALM"
+
+# --- Step 3b: Never show Keycloak's "Update Account Information" page --------------------------
+# Tide asserts ONLY a username (the vuid) -- no email, no name. Keycloak's first-broker-login flow
+# starts with `idp-review-profile`, whose default mode `missing` runs User Profile validation on
+# that identity and renders an UNSTYLED form showing a 64-hex username to every new user.
+#
+# Turning it off here makes it the DEFAULT for every realm this script creates, rather than a fix
+# someone has to remember afterwards. Collect the details in the APP instead -- a dismissible modal
+# that writes through the Account API (templates/onboarding-modal/).
+#
+# ORDER MATTERS: this runs BEFORE toggle-iga. Once IGA is on, a realm-config write is a governed
+# admin write -- it would return 202 and sit as a change request instead of applying.
+#
+# Setting `updateProfileFirstLoginMode` on the IdP instead does NOTHING: that field is legacy, kept
+# for importing old realms. The runtime check reads the AUTHENTICATOR config, which is what this
+# writes.
+echo "==> Disabling the first-broker-login profile page..."
+TOKEN="$(get_token)"
+REVIEW_EXEC="$(curl -s "$TIDECLOAK_URL/admin/realms/$REALM_NAME/authentication/flows/first%20broker%20login/executions" \
+  -H "Authorization: Bearer $TOKEN")"
+REVIEW_CFG="$(printf '%s' "$REVIEW_EXEC" | jq -r '.[]? | select(.providerId=="idp-review-profile") | .authenticationConfig // empty' | head -1)"
+REVIEW_ID="$(printf '%s' "$REVIEW_EXEC" | jq -r '.[]? | select(.providerId=="idp-review-profile") | .id' | head -1)"
+
+if [ -n "$REVIEW_CFG" ]; then
+  # A stock realm already HAS this config object (alias "review profile config", value "missing"),
+  # so the normal path is an update, not a create. A POST here returns an error.
+  curl -s -o /dev/null -X PUT "$TIDECLOAK_URL/admin/realms/$REALM_NAME/authentication/config/$REVIEW_CFG" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d '{"alias":"review profile config","config":{"update.profile.on.first.login":"off"}}'
+elif [ -n "$REVIEW_ID" ]; then
+  curl -s -o /dev/null -X POST "$TIDECLOAK_URL/admin/realms/$REALM_NAME/authentication/executions/$REVIEW_ID/config" \
+    -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+    -d '{"alias":"review profile config","config":{"update.profile.on.first.login":"off"}}'
+fi
+
+# Read it back -- a 2xx is not proof the value stuck, and the symptom of failure is a page a human
+# sees at signup, long after this script has exited successfully.
+TOKEN="$(get_token)"
+REVIEW_NOW="$(curl -s "$TIDECLOAK_URL/admin/realms/$REALM_NAME/authentication/flows/first%20broker%20login/executions" \
+  -H "Authorization: Bearer $TOKEN" | jq -r '.[]? | select(.providerId=="idp-review-profile") | .authenticationConfig // empty' | head -1)"
+REVIEW_VAL=""
+[ -n "$REVIEW_NOW" ] && REVIEW_VAL="$(curl -s "$TIDECLOAK_URL/admin/realms/$REALM_NAME/authentication/config/$REVIEW_NOW" \
+  -H "Authorization: Bearer $TOKEN" | jq -r '.config["update.profile.on.first.login"] // empty')"
+if [ "$REVIEW_VAL" != "off" ]; then
+  echo "ERROR: could not disable the first-broker-login profile page (read back '${REVIEW_VAL:-<unset>}')." >&2
+  echo "       Every new user would be stopped by Keycloak's Update Account Information form." >&2
+  echo "       Diagnose with templates/skip-idp-review/diagnose-post-signup-page.sh" >&2
+  exit 1
+fi
+
+# --- Step 4: Initialize Tide + enable IGA ---
+echo "==> Initializing Tide realm (license + VRK)..."
+TOKEN="$(get_token)"
+# Do NOT discard this response. A 200 is not proof of a licence: on current TideCloak source the
+# body is the text `CREATED` (licensed), `NEED_PAYMENT` (HTTP 200, NOT licensed) or a 303 carrying
+# a Stripe checkout URL. Older builds answer 200 with an activation package instead. Either way,
+# NEED_PAYMENT and any non-2xx mean the realm has no licence, and everything after this would run
+# against an unlicensed realm and fail somewhere less obvious.
+SETUP_BODY="$(mktemp)"
+SETUP_CODE="$(curl -s -o "$SETUP_BODY" -w '%{http_code}' -X POST "$TIDECLOAK_URL/admin/realms/$REALM_NAME/vendorResources/setUpTideRealm" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/x-www-form-urlencoded" \
+  --data-urlencode "email=$ADMIN_EMAIL" \
+  --data-urlencode "isRagnarokEnabled=true")" || SETUP_CODE="000"
+SETUP_OUT="$(head -c 600 "$SETUP_BODY" 2>/dev/null || true)"
+rm -f "$SETUP_BODY"
+case "$SETUP_CODE" in
+  2??) : ;;
+  303) echo "ERROR: setUpTideRealm answered 303 (paid checkout), so no free-tier licence was issued. Response: $SETUP_OUT" >&2; exit 1 ;;
+  *)   echo "ERROR: setUpTideRealm failed (HTTP $SETUP_CODE). Response: $SETUP_OUT" >&2
+       echo "       The real cause is in the TideCloak container log (look for '[Midgard]')." >&2; exit 1 ;;
+esac
+case "$SETUP_OUT" in
+  *NEED_PAYMENT*) echo "ERROR: setUpTideRealm answered NEED_PAYMENT: the realm is NOT licensed. Check the licence email ($ADMIN_EMAIL)." >&2; exit 1 ;;
+esac
+
+# Stamp iga.attestor=tide on the realm BEFORE enabling IGA. Required so IGA
+# comes up in Tide (cryptographic) governance mode rather than Tideless.
+echo "==> Stamping iga.attestor=tide..."
+TOKEN="$(get_token)"
+REALM_REP=$(curl -s "$TIDECLOAK_URL/admin/realms/$REALM_NAME" -H "Authorization: Bearer $TOKEN")
+UPDATED_REALM=$(echo "$REALM_REP" | jq '.attributes = ((.attributes // {}) + {"iga.attestor":"tide"})')
+curl -s -X PUT "$TIDECLOAK_URL/admin/realms/$REALM_NAME" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  --data-binary "$UPDATED_REALM" > /dev/null
+
+echo "==> Enabling IGA..."
+TOKEN="$(get_token)"
+# toggle-iga must be called AT MOST ONCE, and only when IGA is off. On current source it is a FLIP:
+# `isIGAEnabled` is ignored and each call inverts the state, so a call on a realm that already has
+# IGA on files a DISABLE_IGA change request (202) -- which a drain loop would then approve. Older
+# builds were measured to read the parameter (and to fail open to true on a JSON body). Reading the
+# state first and asserting the response is correct on both.
+IGA_NOW="$(curl -s "$TIDECLOAK_URL/admin/realms/$REALM_NAME" -H "Authorization: Bearer $TOKEN" \
+  | jq -r '.attributes.isIGAEnabled // "false"' 2>/dev/null | tr '[:upper:]' '[:lower:]')"
+if [ "$IGA_NOW" = "true" ]; then
+  echo "    IGA is already enabled on this realm; not calling toggle-iga again."
+else
+  IGA_OUT="$(curl -s -X POST "$TIDECLOAK_URL/admin/realms/$REALM_NAME/tide-admin/toggle-iga" \
+    -H "Authorization: Bearer $TOKEN" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    --data-urlencode "isIGAEnabled=true")"
+  case "$IGA_OUT" in
+    *'"enabled":true'*) : ;;
+    *) echo "ERROR: toggle-iga did not report enabled=true. Response: $IGA_OUT" >&2; exit 1 ;;
+  esac
+  # A 200 with enabled=true can still carry warnings: a failed signing sweep leaves the baseline
+  # change requests PENDING and logins fail closed until they are approved.
+  case "$IGA_OUT" in
+    *'"warnings"'*|*commitFailures*) echo "WARNING: toggle-iga reported warnings. Read them before continuing: $IGA_OUT" >&2 ;;
+  esac
+fi
+
+# --- Step 5: Approve client change requests ---
+echo "==> Approving client and role change requests..."
+sleep 2
+approve_and_commit clients
+approve_and_commit roles
+
+# --- Step 6: Create admin user ---
+echo "==> Creating admin user..."
+TOKEN="$(get_token)"
+curl -s -X POST "$TIDECLOAK_URL/admin/realms/$REALM_NAME/users" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "{\"username\":\"admin\",\"email\":\"$ADMIN_EMAIL\",\"firstName\":\"Admin\",\"lastName\":\"User\",\"enabled\":true,\"emailVerified\":false,\"attributes\":{\"tideInvitable\":[\"true\"]}}"
+
+# Approve user creation change request before proceeding.
+# With IGA enabled, the user is not queryable until its change request is committed.
+echo "==> Approving user change requests..."
+sleep 2
+approve_and_commit users
+
+TOKEN="$(get_token)"
+USER_ID=$(curl -s "$TIDECLOAK_URL/admin/realms/$REALM_NAME/users?username=admin" \
+  -H "Authorization: Bearer $TOKEN" | jq -r '.[0].id')
+
+if [ -z "$USER_ID" ] || [ "$USER_ID" = "null" ]; then
+  echo "ERROR: Could not find admin user after creation. Check change-request approval."
+  exit 1
+fi
+
+# NOTE: tide-realm-admin is granted LAST (after enrollment + signed IdP settings),
+# because committing that grant flips the realm firstAdmin -> multiAdmin. No
+# server-driven governed write may run after the flip. See Step 10b below.
+
+# --- Step 7: Generate invite link ---
+echo "==> Generating invite link..."
+TOKEN="$(get_token)"
+INVITE_LINK=$(curl -s -X POST \
+  "$TIDECLOAK_URL/admin/realms/$REALM_NAME/tideAdminResources/get-required-action-link?userId=$USER_ID&lifespan=43200" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '["link-tide-account-action"]')
+
+echo ""
+echo "============================================"
+echo "Open this link in a browser to link your admin Tide account:"
+echo "$INVITE_LINK"
+echo "============================================"
+echo ""
+
+# The ONLY point in this script where a human is guaranteed to be present and idle. Everything else
+# an agent can do unattended -- and does, which is why asking anywhere else gets skipped: an agent
+# optimising for "finish without the human" makes both calls itself and reports them afterwards as
+# decisions rather than questions. Both choices are cheap to change and expensive to not be asked
+# about, so they go HERE, where the human is already waiting on the link. See AP-87.
+cat <<BANNER
+
+--------------------------------------------
+WHILE YOU ARE HERE — two things your users will see. Both are your call.
+
+1) BRANDING. Right now they see TIDE's logo at sign-in, not yours.
+   Say which you want and the agent will do it:
+     - generate one from the app's type   (vault identity notes chat data finance health media commerce)
+     - you supply artwork                 (drop logo.png + background.jpg in ./branding/)
+     - write me a prompt for an image AI  (tailored to this app)
+     - leave it as Tide's
+
+2) NEW-USER DETAILS. Tide gives each new user an account with NO name or email, and the Keycloak
+   signup form is already turned OFF for this realm. Which do you actually want to collect in-app?
+     - a display name        - first/last name        - email (Tide does NOT need it for recovery)
+     - nothing; the vuid is enough
+
+   AGENT: ask these as QUESTIONS and wait for the answer. Do not pick for the user and report it
+   afterwards -- that is the one failure this placement exists to prevent.
+--------------------------------------------
+
+BANNER
+
+# --- Step 8: Wait for account linking ---
+echo "Waiting for admin to link Tide account (polling every 5s)..."
+while true; do
+  TOKEN="$(get_token)"
+  KEY=$(curl -s "$TIDECLOAK_URL/admin/realms/$REALM_NAME/users?username=admin" \
+    -H "Authorization: Bearer $TOKEN" | jq -r '.[0].attributes.tideUserKey[0] // empty')
+  [ -n "$KEY" ] && echo "  Account linked." && break
+  sleep 5
+done
+
+# --- Step 9: Approve ALL pending change requests ---
+# Account linking generates user change requests (tideUserKey write).
+# IGA toggle and setUpTideRealm may generate accumulated client change requests.
+# Sweep all types to ensure nothing is left pending.
+echo "==> Approving all pending change requests..."
+sleep 2
+approve_and_commit users
+approve_and_commit roles
+approve_and_commit clients
+
+# --- Step 10: Point the tide IdP at this realm's console origin, then sign it ---
+# CustomAdminUIDomain must be the TideCloak console origin for THIS realm, not
+# the app URL. sign-idp-settings needs healthy ORKs. Both run while still
+# firstAdmin (before the grant flip below).
+echo "==> Configuring CustomAdminUIDomain (console origin) + signing IdP settings..."
+TIDE_CONSOLE_ORIGIN="${TIDECLOAK_PUBLIC_URL:-$TIDECLOAK_URL}/realms/$REALM_NAME/tide-console/"
+TOKEN="$(get_token)"
+INST=$(curl -s "$TIDECLOAK_URL/admin/realms/$REALM_NAME/identity-provider/instances/tide" \
+  -H "Authorization: Bearer $TOKEN")
+UPDATED=$(echo "$INST" | jq --arg d "$TIDE_CONSOLE_ORIGIN" '.config.CustomAdminUIDomain=$d')
+curl -s -X PUT "$TIDECLOAK_URL/admin/realms/$REALM_NAME/identity-provider/instances/tide" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" -d "$UPDATED" > /dev/null
+
+curl -s -X POST "$TIDECLOAK_URL/admin/realms/$REALM_NAME/vendorResources/sign-idp-settings" \
+  -H "Authorization: Bearer $TOKEN" > /dev/null
+
+# --- Step 10b: Grant tide-realm-admin LAST, then final drain (flips to multiAdmin) ---
+echo "==> Granting tide-realm-admin to the enrolled admin..."
+TOKEN="$(get_token)"
+RM_UUID=$(curl -s "$TIDECLOAK_URL/admin/realms/$REALM_NAME/clients?clientId=realm-management" \
+  -H "Authorization: Bearer $TOKEN" | jq -r '.[0].id')
+
+if [ -z "$RM_UUID" ] || [ "$RM_UUID" = "null" ]; then
+  echo "ERROR: realm-management client not found."
+  exit 1
+fi
+
+ROLE_JSON=$(curl -s "$TIDECLOAK_URL/admin/realms/$REALM_NAME/clients/$RM_UUID/roles/tide-realm-admin" \
+  -H "Authorization: Bearer $TOKEN")
+
+if echo "$ROLE_JSON" | jq -e '.error' > /dev/null 2>&1; then
+  echo "ERROR: tide-realm-admin role not found: $ROLE_JSON"
+  exit 1
+fi
+
+TOKEN="$(get_token)"
+curl -s -X POST "$TIDECLOAK_URL/admin/realms/$REALM_NAME/users/$USER_ID/role-mappings/clients/$RM_UUID" \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d "[$ROLE_JSON]" > /dev/null
+
+# Final drain: commits GRANT_ROLES and flips firstAdmin -> multiAdmin.
+# No governed write may run after this point.
+echo "==> Final drain (commit grant + firstAdmin -> multiAdmin flip)..."
+sleep 2
+approve_and_commit roles
+
+# --- Step 11: Export adapter JSON ---
+echo "==> Exporting adapter config..."
+TOKEN="$(get_token)"
+CLIENT_UUID=$(curl -s "$TIDECLOAK_URL/admin/realms/$REALM_NAME/clients?clientId=$CLIENT_NAME" \
+  -H "Authorization: Bearer $TOKEN" | jq -r '.[0].id')
+
+curl -s "$TIDECLOAK_URL/admin/realms/$REALM_NAME/vendorResources/get-installations-provider?clientId=$CLIENT_UUID&providerId=keycloak-oidc-keycloak-json" \
+  -H "Authorization: Bearer $TOKEN" > "$ADAPTER_OUTPUT"
+
+echo ""
+echo "============================================"
+echo "Bootstrap complete!"
+echo "Adapter config: $ADAPTER_OUTPUT"
+echo "TideCloak URL:  $TIDECLOAK_URL"
+echo "Realm:          $REALM_NAME"
+echo "Client:         $CLIENT_NAME"
+echo "============================================"
+
+echo ""
+echo "--------------------------------------------"
+echo "TWO THINGS YOUR USERS WILL SEE. Decide them now."
+echo ""
+echo "1) BRANDING — right now they see TIDE's logo at sign-in, not yours."
+echo "     bash templates/enclave-branding/brand-tidecloak.sh --realm $REALM_NAME \\"
+echo "          --kind <vault|identity|notes|chat|data|finance|health|media|commerce|generic>"
+echo "     Or drop your own artwork in ./branding/ and pass --logo/--background."
+echo ""
+echo "2) NEW-USER DETAILS — Tide gives each new user a unique account with NO name or email."
+echo "   The Keycloak signup form is already turned OFF for this realm, so collect them in YOUR app:"
+echo "   Tell the agent which fields you want; it calls tide_onboarding and WRITES the"
+echo "   component into your app already wired up. You should not have to copy a template."
+echo "   It updates the user through the Account API with the user's own token. Ask which fields you"
+echo "   actually need first — and never invent a placeholder email (AP-85)."
+echo "--------------------------------------------"

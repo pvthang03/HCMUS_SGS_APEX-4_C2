@@ -22,6 +22,8 @@ export const Dashboard: React.FC<DashboardProps> = ({
   const balance = treasury?.balance ?? 1000;
   const transactions = treasury?.transactions ?? [];
   const vendors = treasury?.vendors ?? [];
+  const limit = policy?.policy?.tiers?.['1']?.maxAmountExclusive ?? 50;
+  const policyVersion = policy?.policy?.version ?? 1;
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: '2rem' }}>
@@ -74,7 +76,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
             </span>
           </div>
           <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.5rem' }}>
-            Enforced by TideCloak Mock Bank Enclave • Zero unilateral override
+            Bank re-verifies Tide-signed approvals • no admin override path
           </p>
         </div>
 
@@ -97,7 +99,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
             </span>
           </div>
           <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.5rem' }}>
-            Every settlement verified with VVK cryptographic signatures
+            Every settlement re-verifies approver tokens against the realm VVK
           </p>
         </div>
 
@@ -121,7 +123,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
               color: 'var(--tide-cyan)',
               fontWeight: 700
             }}>
-              FORSETI POLICY
+              QUORUM POLICY
             </span>
           </div>
           <div style={{ marginTop: '0.75rem' }}>
@@ -145,10 +147,10 @@ export const Dashboard: React.FC<DashboardProps> = ({
         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: '1.25rem' }}>
           <div>
             <h3 style={{ fontSize: '1.1rem', fontWeight: 700, color: '#fff' }}>
-              Action Governance Tiers (Forseti Policy)
+              Action Governance Tiers (policy v{policyVersion})
             </h3>
             <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-              Cryptographic gates enforced by TideCloak before any action signature can be minted
+              Approvals are Tide sessions signing the exact action; the bank counts them
             </p>
           </div>
         </div>
@@ -192,7 +194,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
               Routine Payments &lt; 50
             </h4>
             <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.25rem' }}>
-              Minor payments under 50 credits to already-approved guild vendors.
+              Minor payments under {limit} credits to already-approved guild vendors.
             </p>
           </div>
 
@@ -211,7 +213,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
               Major Action Quorum
             </h4>
             <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.25rem' }}>
-              Payments &ge; 50 credits, new vendor onboarding, member data exports.
+              Payments &ge; {limit} credits, or to a vendor not yet approved.
             </p>
           </div>
 
@@ -230,7 +232,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
               Constitutional Rules
             </h4>
             <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.25rem' }}>
-              Modifying thresholds or approver roster. Admin cannot weaken rules alone.
+              Changing limits or quorum sizes. Admin cannot weaken rules alone.
             </p>
           </div>
         </div>

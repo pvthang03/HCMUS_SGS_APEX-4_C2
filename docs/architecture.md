@@ -1,110 +1,69 @@
-# Architecture & Integration Decisions — Leashed
+# Leashed architecture and integration decisions
 
-*Hackathon Prototype for UNLOCKED (RMIT x Tide, Challenge 2)*
-
----
-
-## 1. System Overview
-
-**Leashed** is a community guild treasury governed by an AI agent ("Quartermaster"). The agent reads invoices, drafts payment proposals, and maintains the ledger. However, it holds **no authority to move money**.
-
-Authority is strictly governed by **TideCloak** and **Forseti Policy Rules**:
-- Any payment $\ge 50$ credits requires a **2-of-3 human approver quorum**.
-- Any policy change or threshold update requires a **3-of-3 human approver quorum**.
-- An admin (moderator) can manage users and inspect logs, but **cannot spend, weaken rules, or approve alone**.
-- The AI agent can draft proposals and read invoices, but **can never approve or directly execute transactions**.
-- The downstream **Mock Bank** refuses to execute any transaction unless accompanied by a cryptographically verified **Tide-backed Authorization** signed by the realm's Verifiable Validation Key (VVK), bound to the exact transaction hash (amount, payee, nonce).
+## Flow
 
 ```
-┌────────────────────────────────────────────────────────┐
-│                      Web UI (React)                    │
-│   (Dashboard • Agent Logs • Approvals • Demo Panel)    │
-└───────────────────────────┬────────────────────────────┘
-                            │ API calls (JWT + RFC 9449 DPoP)
-                            ▼
-┌────────────────────────────────────────────────────────┐
-│                      API Server                        │
-│   /auth         /policy        /approvals              │
-│   /treasury     /agent-gateway                         │
-└────────────┬─────────────────────────────▲─────────────┘
-             │ tool calls only via gateway  │
-             ▼                             │ verifies proof
-┌─────────────────────────┐                │
-│    Agent (Quartermaster)│                ▼
-│    - Reads Invoices     │      ┌───────────────────────┐
-│    - Drafts Proposals   │      │ Mock Bank Engine      │
-│    (Zero Master Key)    │      │ - Verifies VVK Sig    │
-└─────────────────────────┘      │ - Verifies Nonce & Hash│
-                                 │ - Direct call = 403   │
-                                 └───────────────────────┘
+ Approver's browser (Tide session)                      App server (no keys)            Mock bank (no keys)
+ ─────────────────────────────────                      ────────────────────            ───────────────────
+ login via TideCloak + Tide enclave
+   → access token, VVK-signed by the ORKs, with
+     realm roles and cnf.jkt (thumbprint of a
+     DPoP key generated in this browser)
+ press Approve on proposal P
+   secureFetch POST /api/approvals/P/approve/<sha256(action)>
+     Authorization: DPoP <token>
+     DPoP: <proof signed by the browser key over that URL>  ──►  withAuth: verify token (VVK) + proof
+                                                                recordApproval: same verifier as bank,
+                                                                store (token, proof) as evidence
+ press Execute                                          ──────►  bank.execute(action, evidence)  ──►  recompute sha256(action)
+                                                                                                     re-verify every token (VVK) and proof
+                                                                                                     count distinct `approver` subs ≥ tier
+                                                                                                     consume nonce, settle
+ Quartermaster agent (no Tide identity) ── gateway ───────────►  propose / bank.execute(action, [])  ──►  refused: 0 verified
 ```
 
----
+## Integration decisions (Raziel, Tide's MCP)
 
-## 2. Integration Decisions (Raziel MCP Discovery)
+Playbooks consulted: `react-vite-internal-dashboard` scaffold, `verify-jwt-server-side`, the DPoP verifier template, `bootstrap-realm-from-template` (shared `bootstrap-tidecloak.sh`), `iga-change-requests-api`, `custom-contracts`, `deploy-forseti-policy`, `agent-authority`, `verifiable-claims`. Local copies of what we read are in [docs/raziel_discovery/](raziel_discovery/).
 
-During Step 0 discovery, we consulted **Raziel** (Tide's Model Context Protocol server v1.9.33) across all relevant canon, playbooks, security invariants, and gap mappings:
+**Candidate X, policy-governed signing (Forseti): not used.** The built-in threshold contracts (`GenericRealmAccessThresholdRole:1`) only validate approvers. Signing an arbitrary payload under rules needs a custom contract, and Raziel states that uploading custom Forseti contracts "is not self-service … done by the Tide team". The EXPLICIT multi-approver shape is also marked "predicted, not yet network-verified" (GAP-072). That is not workable in hackathon time, so the draft contract stays undeployed.
 
-### 2.1 Playbooks & Canon Consulted
+**Candidate Y, IGA change request per payment: not used.** IGA change requests govern IAM operations (`CREATE_USER`, `GRANT_ROLES`, …) and cannot bind an amount, payee or nonce. A short-lived role grant per payment would need two quorum ceremonies per payment and still would not bind the amount.
 
-1. **Auth & Frontend Integration (`tide_playbook: add-auth-nextjs-fresh`, `react-vite-internal-dashboard` template):**
-   - Tide uses OIDC with sender-constrained DPoP (RFC 9449) tokens.
-   - The frontend authenticates via TideCloak and communicates with the backend passing both `Authorization: DPoP <token>` and `DPoP: <proof>`.
-   - The local client adapter (`tidecloak.json`) must contain the embedded `jwk` (Verifiable Validation Key / local JWKS) to avoid insecure remote JWKS fetches (Invariant I-04, AP-04).
+**Chosen, the nearest honest equivalent.** We use two things TideCloak does enforce cryptographically:
+1. **Identity and roles.** Tokens are signed by the realm VVK, and IGA (Tide mode) governs who holds `approver`.
+2. **Sender-constrained tokens.** DPoP binds a token to a browser-held key.
 
-2. **Server-Side Token & DPoP Verification (`tide_playbook: verify-jwt-server-side`, `templates/dpop-verify/verifyDpop.ts`):**
-   - Every protected API route must verify both the JWT claims (`iss`, `azp`, `exp`, `iat`) and the RFC 9449 DPoP proof (`typ: dpop+jwt`, `htm`, `htu`, `iat`, `jti`, `cnf.jkt` thumbprint matching).
-   - Invariant I-12: Tokens are sender-constrained; a bare `Bearer` token or a replay with an expired/mismatched DPoP proof must be strictly rejected.
+Encoding the action digest in the approval URL makes each approver's DPoP proof a signature over the exact action. A downstream verifier can then check quorum without trusting the app server. The quorum count itself is our code (see Limitations in the README).
 
-3. **Autonomous Agent Identity & Authority (`tide_canon: agent-authority`, GAP-063, GAP-064):**
-   - Autonomous processes cannot hold direct Tide identities or produce ORK signatures headlessly (GAP-064: No headless/CLI auth; GAP-063: ORK signing is browser/JS-SDK only).
-   - **Architectural pattern:** The agent operates as a proposing identity with role `agent`. The agent's decision is merely an input; authority is exclusively exercised by human-owned browser sessions holding the `approver` role.
-   - Anti-pattern AP-37: The server must never auto-approve on behalf of an agent.
+## Who enforces what
 
-4. **Candidate Evaluation: Candidate X vs. Candidate Y:**
-   - **Candidate Y (Fallback — IGA Change Requests):** Raziel's canon `iga-change-requests-api.md` reveals that IGA change requests are tied to Keycloak IAM administrative operations (`CREATE_USER`, `DELETE_USER`, `GRANT_ROLES`, `DELETE_REALM`). Representing treasury payments as temporary role grants causes race conditions, fails to bind to specific payment parameters (amount, recipient, nonce), and misuses IAM lifecycle for application transactions.
-   - **Candidate X (Chosen — Policy-Governed Signing / Forseti Contract):** A C# Forseti contract (`LeashedTreasuryContract.cs`) encodes the tier and quorum logic. Tide's threshold network evaluates the contract against approver tokens. When quorum is reached, TideCloak issues a cryptographically signed authorization ticket. The Mock Bank verifies this signature with the realm's VVK. No single agent, admin, or server holds the signing key.
-
-### 2.2 Decision Record: Candidate X (Policy-Governed Quorum Signing)
-
-- **Selected Candidate:** **Candidate X**.
-- **Rationale:** Candidate X establishes a cryptographic enforcement boundary. The Bank only executes when presented with a valid authorization ticket signed by Tide's threshold key (VVK) proving quorum approval for the exact transaction tuple `(actionId, amount, payee, nonce)`.
-- **Contract Code:** Written in C# following all six required using directives (`Ork.Forseti.Sdk`, `Cryptide.Tools`, `Ork.Shared.Models.Contracts`, `System`, `System.Collections.Generic`, `System.Text`), implementing `IAccessPolicy` with `ValidateData` (payload check), `ValidateApprovers` (quorum check), and `ValidateExecutor`.
-
----
-
-## 3. Enforcement Boundary: Who Enforces What
-
-To adhere strictly to the **Truth Rule**:
-
-| Security Check | Enforcing Entity | Mechanism |
+| Check | Enforced by | Where |
 |---|---|---|
-| **Identity & Authentication** | TideCloak / Embedded JWKS (`tidecloak.json`) | Local JWKS asymmetric signature verification (`verifyTideJWT`) |
-| **Sender-Constrained Token Protection** | RFC 9449 DPoP Verifier (`verifyDpop.ts`) | Cryptographic thumbprint match (`cnf.jkt`), method (`htm`), URI (`htu`), replay cache (`jti`) |
-| **Role Separation (`approver`, `admin`, `member`, `agent`)** | Server Security Middleware (`withRole`) | Token claims verified against realm/client roles |
-| **Quorum Threshold Gate** | Forseti Policy / Threshold Cryptographic Engine | Multi-signature collection: refuses authorization until required threshold ($N$-of-$M$) of distinct approvers sign |
-| **Anti-Self-Approval & Role Exclusions** | Forseti Contract (`ValidateApprovers`) | Proposer cannot approve own proposal; `agent` role rejected from approval pool |
-| **Payment Execution Gate** | Mock Bank Engine (`execute_payment`) | Cryptographic VVK signature verification; rejects without valid proof even if caller has `admin` role |
-| **Replay & Tamper Prevention** | Mock Bank Engine | Nonce tracking and payload hash `sha256(amount:payee:nonce)` binding |
+| Login, roles in the token, token signature | **TideCloak / ORK network** (VVK threshold signature) | enclave login; verified in [tideJWT.ts](../server/auth/tideJWT.ts) with the adapter's `jwk` |
+| Who holds `approver` / `moderator` | **TideCloak IGA, Tide mode** (change request + enclave approval) | realm; quorum = floor(0.7 × tide-realm-admins), 1 in this dev realm |
+| Token bound to the browser key (no bare-Bearer replay) | **TideCloak** issues `cnf.jkt`; our server checks the proof (RFC 9449) | [verifyDpop.ts](../server/auth/verifyDpop.ts) on every `/api` route |
+| An approval is for this exact action | our verifier (proof `htu` contains sha256 of the action) | [evidence.ts](../server/approvals/evidence.ts) |
+| N distinct approvers per tier, no self-approval, no double count | our verifier | [evidence.ts](../server/approvals/evidence.ts) `countQuorum` |
+| No payment without quorum, no replay, no edited amount | our bank (recomputes the digest, re-verifies all evidence) | [mockBank.ts](../server/treasury/mockBank.ts) |
+| Policy changes need 3 of 3; restart cannot weaken rules | our policy store (replays amendments from the git genesis and re-verifies them) | [policyEngine.ts](../server/policy/policyEngine.ts) |
 
----
+What the app server cannot do, even if fully compromised:
+- It cannot mint a token. It holds no VVK private key; the old repo's key file was removed.
+- It cannot produce an approver's DPoP proof, because the key lives in the approver's browser.
 
-## 4. Roles & Seeded Users
+A compromised server *can* refuse service, show misleading UI, or (if someone edits the bank's code) change the counting rule. That is the boundary Forseti would close.
 
-| Username | Role | Purpose | Capabilities |
-|---|---|---|---|
-| `admin` | `admin` | Guild Moderator | Manage users, view logs. **Cannot spend, approve alone, or edit policy.** |
-| `ari` | `approver` | Quorum Member 1 | Review and approve/reject Tier 1, 2, 3 proposals. |
-| `bo` | `approver` | Quorum Member 2 | Review and approve/reject Tier 1, 2, 3 proposals. |
-| `cleo` | `approver` | Quorum Member 3 | Review and approve/reject Tier 1, 2, 3 proposals. |
-| `dani` | `member` | Guild Member | View ledger, view proposals. No administrative or spending power. |
-| `quartermaster` | `agent` | Autonomous AI Agent | Read invoices, draft proposals. Zero spending authority. |
+## Verification (`npm test`, 16 tests)
 
----
+- Bank refuses a payment with no approvals (agent or admin direct call).
+- Tier 1 pays with 1 approval. Tier 2 is refused at 1 of 2 and settles at 2 of 2.
+- The same approver twice counts once.
+- Moderator evidence is not counted (no `approver` role in the signed token).
+- An edited amount, approvals reused across proposals, and a replayed settlement are all refused.
+- A token signed by a non-realm key is refused. A proof key that does not match `cnf.jkt` is refused.
+- A moderator approve gets 403. A proposer cannot approve their own proposal.
+- A policy change is refused at 2 of 3 and applied at 3 of 3. It survives restart. A tampered state file falls back to the genesis policy.
+- A DPoP-bound token sent as Bearer is rejected. A proof for another URL is rejected.
 
-## 5. Action Tiers
-
-- **Tier 0 (Autonomous):** Read ledger, parse invoice, draft proposal.
-- **Tier 1 (1-of-3 Quorum):** Payments $< 50$ credits to known vendors.
-- **Tier 2 (2-of-3 Quorum):** Payments $\ge 50$ credits, or registering a new vendor.
-- **Tier 3 (3-of-3 Quorum):** Amending policy thresholds or approver rosters. No single admin override.
+The tests use an in-memory Ed25519 key standing in for the realm VVK. That is the only place a "realm key" exists in this repo.

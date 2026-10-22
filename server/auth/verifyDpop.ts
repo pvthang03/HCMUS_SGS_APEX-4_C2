@@ -34,34 +34,21 @@ export class MemoryJtiStore implements JtiStore {
 const defaultStore = new MemoryJtiStore();
 const IAT_SKEW_SECONDS = 300;
 
-export function requestHtu(
-  req: { url: string; headers: Record<string, string | string[] | undefined> },
-  trustForwardedHeaders = true
-): string {
-  // Normalize incoming URL
-  const rawUrl = req.url.startsWith('http') ? req.url : `http://localhost:3001${req.url}`;
-  const url = new URL(rawUrl);
+/**
+ * The browser reaches the API through the app's public origin (Vite proxies /api), so the
+ * proof's htu is that origin + path. Configure it once instead of trusting forwarded headers.
+ */
+export function publicUrl(pathname: string): string {
+  const base = (process.env.CLIENT_APP_URL || 'http://localhost:5173').replace(/\/+$/, '');
+  return `${base}${pathname}`;
+}
 
-  if (trustForwardedHeaders) {
-    const hostHeader = req.headers['x-forwarded-host'];
-    const protoHeader = req.headers['x-forwarded-proto'];
-    const host = Array.isArray(hostHeader) ? hostHeader[0] : hostHeader;
-    const proto = Array.isArray(protoHeader) ? protoHeader[0] : protoHeader;
-
-    if (host) {
-      const h = host.split(',')[0].trim();
-      const p = proto ? proto.split(',')[0].trim() : url.protocol.replace(':', '');
-      return `${p}://${h}${url.pathname}`;
-    }
-  }
-
-  // The client signs origin + pathname — no query string
-  return `${url.origin}${url.pathname}`;
+export function requestHtu(req: { url: string }): string {
+  return publicUrl(new URL(req.url, 'http://placeholder').pathname);
 }
 
 export interface VerifyDpopOptions {
   jtiStore?: JtiStore;
-  trustForwardedHeaders?: boolean;
   iatSkewSeconds?: number;
 }
 
@@ -132,7 +119,7 @@ export async function verifyDpop(
 
   // ath check ties proof to the exact access token
   const expectedAth = base64url(await sha256(accessToken));
-  if (payload.ath && payload.ath !== expectedAth) {
+  if (payload.ath !== expectedAth) {
     throw new DpopError('DPoP proof ath does not match the presented access token.');
   }
 
@@ -142,16 +129,9 @@ export async function verifyDpop(
   }
 
   // htu check (HTTP URI)
-  const htu = requestHtu(req, opts.trustForwardedHeaders ?? true);
-  if (typeof payload.htu === 'string') {
-    // Normalize both for comparison (strip trailing slashes)
-    const normPayloadHtu = (payload.htu as string).replace(/\/$/, '');
-    const normHtu = htu.replace(/\/$/, '');
-    if (normPayloadHtu !== normHtu) {
-      throw new DpopError(
-        `DPoP proof htu '${String(payload.htu)}' does not match '${htu}'.`
-      );
-    }
+  const htu = requestHtu(req);
+  if (payload.htu !== htu) {
+    throw new DpopError(`DPoP proof htu '${String(payload.htu)}' does not match '${htu}'.`);
   }
 
   // iat freshness

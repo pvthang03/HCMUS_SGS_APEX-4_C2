@@ -13,12 +13,21 @@ function getConfig() {
   return { config: _config, JWKS: _jwks! };
 }
 
-export async function verifyTideJWT(token: string): Promise<JWTPayload> {
+/**
+ * Verify a TideCloak access token against the realm VVK embedded in the adapter (Invariant I-04).
+ * `currentDate` lets the bank re-check archived approval evidence as of the moment it was signed.
+ */
+export async function verifyTideJWT(
+  token: string,
+  opts: { currentDate?: Date } = {}
+): Promise<JWTPayload> {
   const { config, JWKS } = getConfig();
 
   const options: JWTVerifyOptions = {
     issuer: `${config['auth-server-url'].replace(/\/+$/, '')}/realms/${config.realm}`,
-    clockTolerance: 10
+    algorithms: ['EdDSA'],
+    clockTolerance: 10,
+    currentDate: opts.currentDate
   };
 
   const { payload } = await jwtVerify(token, JWKS, options);
@@ -26,16 +35,6 @@ export async function verifyTideJWT(token: string): Promise<JWTPayload> {
   // TideCloak access tokens use azp (authorized party) for the client ID
   if (payload.azp !== config.resource) {
     throw new Error(`Token azp mismatch: expected ${config.resource}, got ${payload.azp}`);
-  }
-
-  const now = Math.floor(Date.now() / 1000);
-
-  if (payload.exp && payload.exp < now) {
-    throw new Error('Token expired');
-  }
-
-  if (payload.iat && payload.iat > now + 60) {
-    throw new Error('Token issued in future');
   }
 
   return payload;

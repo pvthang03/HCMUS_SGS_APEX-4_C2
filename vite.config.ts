@@ -5,11 +5,11 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 5173,
+    // GitHub Codespaces serves the app as https://<codespace>-5173.app.github.dev
+    allowedHosts: ['.app.github.dev', 'localhost'],
     proxy: {
-      '/api': {
-        target: 'http://localhost:3001',
-        changeOrigin: true
-      }
+      // Same-origin API: the DPoP proof's htu is this origin + /api/...
+      '/api': { target: 'http://localhost:3001', changeOrigin: true }
     }
   }
 });
