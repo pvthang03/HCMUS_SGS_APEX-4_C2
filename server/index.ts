@@ -245,7 +245,7 @@ app.post('/api/attacks/rogue-admin', async (req: AuthenticatedRequest, res) => {
     });
     record('Lower the Tier 1 limit to 1000 credits without the council', false, 'policy changed');
   } catch (e: any) {
-    record('Lower the Tier 1 limit to 1000 credits without the council', true, e.message);
+    record('Lower the Tier 1 limit to 1000 credits without the council', true, e.message.split(' Rejected:')[0]);
   }
 
   res.json({ actor: u.username, role: u.role, attempts });

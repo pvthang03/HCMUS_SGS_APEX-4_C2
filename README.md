@@ -61,6 +61,10 @@ npm run dev:live         # the same app, signed in through @tidecloak/react with
 
 The Demo panel runs the scenarios step by step ([demo/scenarios.md](demo/scenarios.md)). For non-technical teammates there is a recording guide in Vietnamese: [HUONG-DAN-QUAY-VIDEO.pdf](HUONG-DAN-QUAY-VIDEO.pdf).
 
+## Demo video
+
+[Video.mp4](Video.mp4) is 2 minutes long. It was recorded from the running app in the simulated sign-in mode (Plan C), with English captions. The script it follows, with timings, is [demo/scenarios.md](demo/scenarios.md). A copy without captions, for voice-over, is [demo/Video-no-captions.mp4](demo/Video-no-captions.mp4).
+
 ## How it works
 
 ```
