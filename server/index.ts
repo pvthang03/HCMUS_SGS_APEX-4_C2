@@ -24,12 +24,17 @@ import { mockBank, BankRefusal } from './treasury/mockBank.js';
 import { getAgentLogs, logAction } from './agent/agentGateway.js';
 import { quartermasterAgent } from './agent/quartermaster.js';
 import seedData from './data/seed.json' with { type: 'json' };
+import { startSimIdp, issueSimToken, simUsers } from './auth/simIdp.js';
 
 try {
   process.loadEnvFile('.env');
 } catch {
   // .env is optional; CLIENT_APP_URL falls back to http://localhost:5173
 }
+
+// Plan C by default: simulated TideCloak sign-in. LEASHED_IDP=tidecloak uses the live realm.
+const SIM = process.env.LEASHED_IDP !== 'tidecloak';
+if (SIM) await startSimIdp();
 
 const app = express();
 const PORT = Number(process.env.PORT || 3001);
@@ -42,8 +47,20 @@ function fail(res: Response, e: any) {
 
 app.get('/api/health', (_req, res) => {
   const cfg = loadTideConfig();
-  res.json({ status: 'ONLINE', realm: cfg.realm, tidecloak: cfg['auth-server-url'], appUrl: process.env.CLIENT_APP_URL });
+  res.json({ status: 'ONLINE', mode: SIM ? 'sim' : 'tidecloak', realm: cfg.realm, tidecloak: cfg['auth-server-url'], appUrl: process.env.CLIENT_APP_URL });
 });
+
+if (SIM) {
+  // Plan C only: stands in for TideCloak's login. See server/auth/simIdp.ts.
+  app.get('/api/sim/users', (_req, res) => res.json(simUsers));
+  app.post('/api/sim/login', async (req, res) => {
+    try {
+      res.json({ accessToken: await issueSimToken(req.body?.username, req.body?.dpopJwk) });
+    } catch (e: any) {
+      res.status(400).json({ message: e.message });
+    }
+  });
+}
 
 // Every route below verifies the TideCloak access token (realm VVK) and the DPoP proof.
 app.use('/api', withAuth);
@@ -120,7 +137,7 @@ app.post('/api/approvals/:id/execute', async (req: AuthenticatedRequest, res) =>
     logAction({
       actor: req.user!.username,
       tool: 'execute',
-      actionSummary: `Executed ${p.id} (${p.evaluation.tierName}) with ${p.approvals.length} Tide-signed approval(s)`,
+      actionSummary: `Executed ${p.id} (${p.evaluation.tierName}) with ${p.approvals.length} verified approval(s)`,
       status: 'EXECUTED',
       tier: p.evaluation.tier,
       enforcedBy: p.action.kind === 'PAYMENT' ? 'Bank verifier' : 'Policy store verifier',

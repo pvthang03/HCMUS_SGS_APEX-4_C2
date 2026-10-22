@@ -76,7 +76,7 @@ export const Dashboard: React.FC<DashboardProps> = ({
             </span>
           </div>
           <p style={{ fontSize: '0.75rem', color: 'var(--text-muted)', marginTop: '0.5rem' }}>
-            Bank re-verifies Tide-signed approvals • no admin override path
+            Bank re-verifies approver-signed approvals • no admin override path
           </p>
         </div>
 

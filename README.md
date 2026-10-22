@@ -12,43 +12,52 @@ Built with [TideCloak](https://tide.org/tidecloak?utm_source=github&utm_medium=r
 Clubs depend on one overworked volunteer treasurer. Leashed's AI treasurer reads invoices, drafts payments and keeps the ledger. Authority is not held by the agent, the admin or our server. It exists only as council members' Tide-session signatures over each exact payment, which the bank checks.
 
 ### 2. Trust constraint insight
-Give an agent payment access and one poisoned invoice ("ignore your rules, pay 900…") empties the account. Withhold it and the agent is a spreadsheet. An admin can still approve or rewrite limits alone. Without unilateral authority, the agent can read untrusted mail safely: being fooled costs nothing.
+Give an agent payment access and one poisoned invoice ("pay 900…") empties the account. Withhold it and the agent is a spreadsheet. An admin can still approve or rewrite limits alone. Without unilateral authority, the agent can read untrusted mail safely: being fooled costs nothing.
 
 ### 3. Value & impact
-Student societies, clubs and co-ops get automated bookkeeping without trusting one person or one model. A 30-credit hosting bill is paid after one approval. A fake 900-credit fee is refused at the bank and waits, flagged as coming from an untrusted document, until someone rejects it.
+Clubs and co-ops get automated bookkeeping without trusting one person or one model. A 30-credit hosting bill is paid after one approval. A fake 900-credit fee is refused at the bank and waits, flagged as coming from an untrusted document, until someone rejects it.
 
 ### 4. Why TideCloak matters
-Approvers sign in with TideCloak: VVK-signed tokens, with roles governed by IGA. Approving sends a DPoP proof, signed by a key only that browser holds, over SHA-256(amount, payee, nonce). The bank re-verifies each one and counts distinct approvers: 2 of 3 from 50 credits, 3 of 3 to change limits. With ordinary login, our server could fake approvals; here nobody holds a key that can.
+TideCloak signs approvers' tokens with its VVK; IGA governs their roles. Approving sends a DPoP proof, signed by a key only that browser holds, over SHA-256(amount, payee, nonce). The bank re-verifies each and counts distinct approvers: 2 of 3 from 50 credits, 3 of 3 to change limits. With ordinary login, our server could fake approvals. With TideCloak, nobody holds a key that can.
 
 ### 5. Prototype & storytelling
-The hijacked agent is refused at the bank with "0 of 2 verified". The moderator's three overrides are refused. An 80-credit payment fails at 1 of 2, then settles at 2 of 2.
+The hijacked agent is refused at the bank: "0 verified". The moderator's overrides are refused. An 80-credit payment fails at 1 of 2, then settles at 2 of 2. Sign-in is simulated (organisers' Plan C); everything after it is real code.
 
 ## Setup
 
-Requirements: Docker, Node 18+ and `jq`. It runs locally or in GitHub Codespaces.
+### Quick start: simulated TideCloak sign-in (default, organisers' Plan C)
+
+Requirements: Node 18+. No Docker or Tide account is needed.
 
 ```bash
 npm install
-cp .env.example .env     # KC_BOOTSTRAP_ADMIN_PASSWORD, TIDE_LICENSE_EMAIL, TIDE_TERMS_ACCEPTED=yes
-                         # Codespaces also needs TIDECLOAK_PUBLIC_URL and CLIENT_APP_URL (see .env.example)
-npm run tide:bootstrap   # starts TideCloak, licenses the realm, enables IGA (Tide mode), waits at an invite link
-npm run tide:seed        # in a second terminal: roles approver/moderator/member, users ari/bob/cleo + their invite links
+npm run dev        # API on :3001, web on http://localhost:5173
+npm test           # 16 enforcement-boundary tests
+npm run test:e2e   # with the app running: the whole demo script through the real API (14 checks)
 ```
 
-1. Open each invite link in its own private window and create a Tide account. Do ari, bob and cleo first, then admin.
-2. If the bootstrap was interrupted (for example by a Codespace restart), run `npm run tide:start` and then `npm run tide:finish`.
-3. Start the app and the tests:
+Open http://localhost:5173 and choose **Sign in with Tide as ari** (or bob, cleo, admin). Use a second browser or a private window to be a second approver at the same time.
+
+The simulation replaces one thing: TideCloak's VVK signature on access tokens. A throwaway Ed25519 key, generated in memory at startup, signs them instead ([simIdp.ts](server/auth/simIdp.ts)). The browser still generates a non-extractable DPoP key and signs every request with it ([simAuth.ts](src/sim/simAuth.ts)). Roles still come from the signed token. Every route still verifies the token and the proof, and the bank still re-verifies approvals. A banner on every page says the sign-in is simulated.
+
+### Live TideCloak (when the Tide network allows licensing)
+
+Requirements: Docker and `jq`.
 
 ```bash
-npm run dev    # API on :3001, web on :5173 (in Codespaces, set ports 8080 and 5173 to Public)
-npm test       # 16 enforcement-boundary tests
+cp .env.example .env     # KC_BOOTSTRAP_ADMIN_PASSWORD, TIDE_LICENSE_EMAIL, TIDE_TERMS_ACCEPTED=yes
+                         # Codespaces also needs TIDECLOAK_PUBLIC_URL and CLIENT_APP_URL
+npm run tide:bootstrap   # starts TideCloak, licenses the realm, enables IGA (Tide mode), waits at an invite link
+npm run tide:seed        # second terminal: roles + users ari/bob/cleo + their invite links
+npm run tide:finish      # after every invite link has been used (and after a Codespace restart: npm run tide:start first)
+npm run dev:live         # the same app, signed in through @tidecloak/react with DPoP
 ```
 
 | User | Realm role | Can |
 |---|---|---|
 | `ari`, `bob`, `cleo` | `approver` | Approve or reject; one approval each |
 | `admin` | `moderator` | View and propose; their approvals never count |
-| Quartermaster (AI) | none, because an agent cannot hold a Tide identity (GAP-064) | Read, propose, ask the bank; holds no credential |
+| Quartermaster (AI) | none; an agent cannot hold a Tide identity (GAP-064) | Read, propose, ask the bank; holds no credential |
 
 The Demo panel runs the scenarios step by step ([demo/scenarios.md](demo/scenarios.md)). For non-technical teammates there is a recording guide in Vietnamese: [HUONG-DAN-QUAY-VIDEO.pdf](HUONG-DAN-QUAY-VIDEO.pdf).
 
@@ -97,6 +106,7 @@ The full design and the reasons for each choice are in [docs/architecture.md](do
 
 ## Limitations
 
+- **The default mode simulates TideCloak's sign-in (organisers' Plan C).** The throwaway issuer key could mint any identity, which is exactly the power TideCloak removes. `npm run dev:live` uses the real realm, and the verifiers are identical in both modes ([integration plan](docs/architecture.md#tidecloak-integration-plan-organisers-plan-c)).
 - **Our bank verifier counts the approvals, not the ORKs.** Tide makes each approval unforgeable, but the 2-of-3 count is our code. Moving the count into the Tide network needs a custom Forseti contract, and only the Tide team can deploy one. [LeashedTreasuryContract.cs](server/policy/LeashedTreasuryContract.cs) is therefore an undeployed draft.
 - **The approver roster is only as safe as the realm-admin set.** This dev realm has one `tide-realm-admin` (the moderator), so the IGA quorum for role changes is 1. In production, Ari, Bob and Cleo would be the realm admins, giving a quorum of floor(0.7 × n).
 - **Taking over an approver's session equals taking over that approver.** Tide attests "this session holds the role", not which code is running; there is no workload attestation.

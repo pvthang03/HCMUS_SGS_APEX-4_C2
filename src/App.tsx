@@ -32,7 +32,7 @@ export const App: React.FC = () => {
   return (
     <>
       <Authenticated>
-        <Treasury />
+        <LiveTreasury />
       </Authenticated>
       <Unauthenticated>
         <Login />
@@ -66,8 +66,22 @@ const Login: React.FC = () => {
   );
 };
 
-const Treasury: React.FC = () => {
+const LiveTreasury: React.FC = () => {
   const { secureFetch, logout } = useTideCloak();
+  return <Treasury secureFetch={secureFetch} logout={logout} />;
+};
+
+export interface SimControls {
+  users: string[];
+  current: string;
+  onSwitch: (username: string) => void;
+}
+
+export const Treasury: React.FC<{
+  secureFetch: (url: string, init?: RequestInit) => Promise<Response>;
+  logout: () => void;
+  sim?: SimControls;
+}> = ({ secureFetch, logout, sim }) => {
   const [me, setMe] = useState<Me | null>(null);
   const [tab, setTab] = useState<'dashboard' | 'approvals' | 'logs'>('dashboard');
   const [treasury, setTreasury] = useState<any>(null);
@@ -119,7 +133,13 @@ const Treasury: React.FC = () => {
 
   return (
     <div style={{ minHeight: '100vh', display: 'flex', flexDirection: 'column' }}>
-      <Header me={me} onLogout={logout} />
+      <Header me={me} onLogout={logout} sim={sim} />
+      {sim && (
+        <div style={{ background: '#78350F', color: '#FEF3C7', padding: '0.5rem 2rem', fontSize: '0.8rem', textAlign: 'center' }}>
+          <b>SIMULATED SIGN-IN (organisers' Plan C):</b> a local stand-in signs access tokens instead of TideCloak's ORK network.
+          DPoP keys, approval proofs and the bank's verification are the real code.
+        </div>
+      )}
       <main style={{ maxWidth: 1400, margin: '0 auto', padding: '2rem', width: '100%', display: 'flex', flexDirection: 'column', gap: '1.5rem', flex: 1 }}>
         {error && (
           <div style={{ padding: '0.75rem 1rem', borderRadius: 10, border: '1px solid var(--danger-red)', color: 'var(--danger-red)' }}>

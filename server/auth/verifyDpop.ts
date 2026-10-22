@@ -36,15 +36,20 @@ const IAT_SKEW_SECONDS = 300;
 
 /**
  * The browser reaches the API through the app's public origin (Vite proxies /api), so the
- * proof's htu is that origin + path. Configure it once instead of trusting forwarded headers.
+ * proof's htu is that origin + path. The allowed origins are configured (CLIENT_APP_URL, comma
+ * separated, plus the local dev origin) instead of trusting forwarded headers.
  */
-export function publicUrl(pathname: string): string {
-  const base = (process.env.CLIENT_APP_URL || 'http://localhost:5173').replace(/\/+$/, '');
-  return `${base}${pathname}`;
+export function appOrigins(): string[] {
+  const configured = (process.env.CLIENT_APP_URL || '').split(',').map((o) => o.trim().replace(/\/+$/, '')).filter(Boolean);
+  return [...new Set([...configured, 'http://localhost:5173'])];
 }
 
-export function requestHtu(req: { url: string }): string {
-  return publicUrl(new URL(req.url, 'http://placeholder').pathname);
+export function allowedHtus(pathname: string): string[] {
+  return appOrigins().map((o) => `${o}${pathname}`);
+}
+
+export function requestPath(req: { url: string }): string {
+  return new URL(req.url, 'http://placeholder').pathname;
 }
 
 export interface VerifyDpopOptions {
@@ -129,9 +134,9 @@ export async function verifyDpop(
   }
 
   // htu check (HTTP URI)
-  const htu = requestHtu(req);
-  if (payload.htu !== htu) {
-    throw new DpopError(`DPoP proof htu '${String(payload.htu)}' does not match '${htu}'.`);
+  const htus = allowedHtus(requestPath(req));
+  if (!htus.includes(String(payload.htu))) {
+    throw new DpopError(`DPoP proof htu '${String(payload.htu)}' does not match '${htus[0]}'.`);
   }
 
   // iat freshness

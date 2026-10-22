@@ -5,6 +5,7 @@ import type { Me } from '../api/client';
 interface HeaderProps {
   me: Me | null;
   onLogout: () => void;
+  sim?: { users: string[]; current: string; onSwitch: (username: string) => void };
 }
 
 const roleStyle: Record<string, { color: string; label: string; Icon: typeof User }> = {
@@ -13,7 +14,7 @@ const roleStyle: Record<string, { color: string; label: string; Icon: typeof Use
   member: { color: 'var(--text-muted)', label: 'Member', Icon: User }
 };
 
-export const Header: React.FC<HeaderProps> = ({ me, onLogout }) => {
+export const Header: React.FC<HeaderProps> = ({ me, onLogout, sim }) => {
   const r = roleStyle[me?.role || 'member'];
   return (
     <header style={{
@@ -38,7 +39,7 @@ export const Header: React.FC<HeaderProps> = ({ me, onLogout }) => {
           <div>
             <h1 style={{ fontSize: '1.25rem', fontWeight: 800, letterSpacing: '-0.02em', color: '#fff' }}>LEASHED</h1>
             <p style={{ fontSize: '0.8rem', color: 'var(--text-muted)' }}>
-              AI guild treasurer • signed in with TideCloak • approvals are Tide-signed
+              AI guild treasurer • approvals are signed by each approver’s own session
             </p>
           </div>
         </div>
@@ -50,6 +51,16 @@ export const Header: React.FC<HeaderProps> = ({ me, onLogout }) => {
               <div style={{ fontWeight: 700, color: '#fff' }}>{me.username}</div>
               <div style={{ fontSize: '0.75rem', color: r.color }}>{r.label}</div>
             </div>
+            {sim && (
+              <select
+                aria-label="Simulated sign-in"
+                value={sim.current}
+                onChange={(e) => sim.onSwitch(e.target.value)}
+                style={{ padding: '0.4rem', borderRadius: 8, background: 'var(--bg-card)', color: '#fff', border: '1px solid var(--border-color)' }}
+              >
+                {sim.users.map((u) => <option key={u} value={u}>Sign in as {u}</option>)}
+              </select>
+            )}
             <button
               onClick={onLogout}
               style={{

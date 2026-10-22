@@ -87,7 +87,7 @@ async function verifyAmendment(current: Policy, a: PolicyAmendment, maxAgeSecond
   });
   if (approvers.length < required) {
     throw new Error(
-      `Policy change needs ${required} Tide-signed approvals, has ${approvers.length}.` +
+      `Policy change needs ${required} approver-signed approvals, has ${approvers.length}.` +
         (rejected.length ? ` Rejected: ${rejected.join('; ')}` : '')
     );
   }

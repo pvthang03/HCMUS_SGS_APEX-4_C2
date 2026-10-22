@@ -8,7 +8,7 @@ import {
   type JWTPayload
 } from 'jose';
 import { verifyTideJWT, hasRole } from '../auth/tideJWT.js';
-import { publicUrl } from '../auth/verifyDpop.js';
+import { allowedHtus } from '../auth/verifyDpop.js';
 
 /**
  * Approval evidence = the two artefacts an approver's own Tide session produces when they
@@ -112,9 +112,9 @@ export async function verifyApprovalEvidence(
   }
 
   // 4. The signed request is "approve THIS action".
-  const expectedHtu = publicUrl(approvalPath(expected.proposalId, expected.digest));
-  if (proof.htm !== 'POST' || proof.htu !== expectedHtu) {
-    throw new EvidenceError(`Proof signs '${proof.htm} ${proof.htu}', not '${expectedHtu}'.`);
+  const expectedHtus = allowedHtus(approvalPath(expected.proposalId, expected.digest));
+  if (proof.htm !== 'POST' || !expectedHtus.includes(String(proof.htu))) {
+    throw new EvidenceError(`Proof signs '${proof.htm} ${proof.htu}', not 'POST ${expectedHtus[0]}'.`);
   }
 
   // 5. The signer held the approver role (roles are VVK-signed; IGA governs who gets them).

@@ -57,7 +57,7 @@ export class MockBank {
 
     if (approvers.length < required.requiredApprovers) {
       throw new BankRefusal(
-        `Quorum not met: ${required.tierName} needs ${required.requiredApprovers} Tide-signed ` +
+        `Quorum not met: ${required.tierName} needs ${required.requiredApprovers} approver-signed ` +
           `approval(s) for this exact action, ${approvers.length} verified.`,
         { tier: required.tier, required: required.requiredApprovers, verified: approvers.length, rejected }
       );

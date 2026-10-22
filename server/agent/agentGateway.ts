@@ -87,7 +87,7 @@ export class AgentGateway {
         tool: 'execute_payment',
         actionSummary: `Bank settled ${tx.amount} credits to '${tx.payee}'`,
         status: 'EXECUTED',
-        enforcedBy: 'Bank verifier (Tide-signed approvals)',
+        enforcedBy: 'Bank verifier (approver-signed approvals)',
         details: tx
       });
       return { ok: true, message: `Settled ${tx.id}` };

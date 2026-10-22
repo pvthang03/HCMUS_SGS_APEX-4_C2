@@ -106,7 +106,7 @@ export const ApprovalsQueue: React.FC<ApprovalsQueueProps> = ({ approvals, me, o
                 <button
                   disabled={busy === p.id || mine}
                   style={button('var(--success-green)', busy === p.id || mine)}
-                  onClick={() => act(p.id, () => api.approve(p.approvalPath), 'Approval recorded (Tide-signed).')}
+                  onClick={() => act(p.id, () => api.approve(p.approvalPath), 'Approval recorded (signed by your session key).')}
                 >
                   <CheckCircle2 size={14} /> {mine ? 'You approved' : 'Approve'}
                 </button>
