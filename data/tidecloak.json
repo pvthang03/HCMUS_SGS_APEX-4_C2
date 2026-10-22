@@ -1,0 +1,23 @@
+{
+  "realm": "leashed",
+  "auth-server-url": "http://localhost:8080",
+  "ssl-required": "external",
+  "resource": "leashed-client",
+  "public-client": true,
+  "confidential-port": 0,
+  "jwk": {
+    "keys": [
+      {
+        "kty": "EC",
+        "x": "GbyP1UHs4Us87BkiADol88EnZL-ZM3aWxzVTNociIFk",
+        "y": "vhOgfwAYKWUHX3VqzRfVJxylpOGBQGfWVowoiXuxgM4",
+        "crv": "P-256",
+        "kid": "tide-vvk-key-2026",
+        "use": "sig",
+        "alg": "ES256"
+      }
+    ]
+  },
+  "vendorId": "tide-rmit-hackathon-2026",
+  "homeOrkUrl": "https://ork1.tide.org"
+}

@@ -1,0 +1,14 @@
+node_modules/
+dist/
+build/
+.next/
+.tide-pack/
+
+# Secrets & Local Enclave State
+.env
+.env.local
+.env.*.local
+*.log
+
+# Tide state
+data/keycloakdb*

@@ -1,0 +1,153 @@
+> ## ⛔ BEFORE ANY TIDE REALM IS SET UP: ASK THE USER THESE TWO THINGS AND WAIT
+>
+> Setting up a realm licenses it to an email address under Tide's Terms & Conditions. Both answers
+> belong to the user. Ask now, in one message, before starting TideCloak or creating anything:
+>
+> **1. Licence email.** *"Which email address should manage your Tide licence?"* It must be a real
+> address they control. Never invent one and never use a placeholder such as `admin@example.com`.
+>
+> **2. Terms & Conditions.** Show them the link — **https://tide.org/legal** — and ask: *"Do you agree
+> to Tide's Terms & Conditions? (yes/no)"*
+>
+> Only the user can agree. Do not accept for them, do not infer agreement from an earlier
+> instruction such as "just set it up", and do not proceed on silence. If they decline, STOP: do not
+> start, create or license a realm.
+>
+> Then pass exactly what they said to the bootstrap: `TIDE_LICENSE_EMAIL=<their email>
+> TIDE_TERMS_ACCEPTED=yes`. The pack's scripts exit with code 2 without both, and any init script
+> you write yourself must do the same (canon `tidecloak-bootstrap`, AP-90). Ask once per realm; if
+> `.env` already holds both from the user's earlier answer, do not ask again.
+
+---
+> ## ⛔ TWO QUESTIONS YOU MUST ASK THE USER BEFORE THIS BOOTSTRAP IS DONE
+>
+> Ask them at the **invite-link step**, where the script already stops and waits for a human —
+> that is the only moment the user is present and idle. Ask as QUESTIONS and WAIT. Do not choose
+> for them and report it afterwards; that is the single most repeated failure with this pack.
+>
+> **1. Branding.** Right now their users see *Tide's* logo at sign-in, not theirs. Offer: generate
+> one from the app's type, they supply artwork, you write them an image-AI prompt, or leave it.
+> Then call `tide_branding` and RUN the command.
+>
+> **2. What to collect from new users.** Tide gives each new user an account with **no name and no
+> email**, and the Keycloak signup form is turned off. Ask which fields the app actually needs —
+> a display name, first/last name, email (Tide does **not** need it for recovery), or nothing.
+> Then call `tide_onboarding` with those fields: it returns a finished modal component to WRITE
+> into the app, already wired. Never invent a placeholder email (AP-85).
+>
+> Both are cheap to change and expensive to not be asked about.
+
+---
+# Start TideCloak for Development
+
+Start a TideCloak container for local development. This produces a running server with no realm of yours, no client and no Tide admin yet. The image does import one realm of its own on every start, `myrealm` (with clients `myclient`/`mytest` and open registration): leave it alone and do not name your realm `myrealm`.
+
+---
+
+## When to Use
+
+- First step of any TideCloak bootstrap
+- Rebuilding a local TideCloak after a wipe
+- Need a clean TideCloak for testing
+
+**Do not use** if TideCloak is already running and healthy. Check: `curl -sf http://localhost:8080 > /dev/null && echo "Running"`.
+
+---
+
+## Prerequisites
+
+- Docker installed and running (`docker info` succeeds)
+- `sudo` access (data directory permissions)
+- Port 8080 available (or adjust mapping)
+
+---
+
+## Steps
+
+### Step 1: Image
+
+**Always use `tideorg/tidecloak-dev:latest`.** It carries the full Tide protocol and is the only image the pack supports. It is a development build of the server (H2, non-strict hostname) wired to the **production** Tide network — ork1, 14-of-20 — so local development on it talks to live ORKs. The production server image is `tideorg/tidecloak`; see `canon/tidecloak-bootstrap.md`.
+
+Do **not** use `tideorg/tidecloak-stg-dev`. That is an internal pre-release/staging build: it lags or leads production unpredictably, and it targets a **different ORK network** (staging defaults are baked in, not missing), which is an easy way to end up on a broken threshold config. If you believe you need it, you are testing unreleased Tide behaviour — coordinate with the Tide team rather than reaching for it from a playbook.
+
+**Do not append `start-dev` or any command** to `docker run`. TideCloak images have a pre-configured entrypoint. Appending `start-dev` (a vanilla Keycloak convention) breaks Tide initialization.
+
+### Step 2: Clean previous state
+
+```bash
+docker stop tidecloak 2>/dev/null; docker rm tidecloak 2>/dev/null
+mkdir -p ./data
+sudo rm -f ./data/keycloakdb* 2>/dev/null
+sudo chown -R 1000:1000 ./data
+```
+
+Check port conflict:
+```bash
+lsof -i :8080 >/dev/null 2>&1 && echo "ERROR: Port 8080 in use" && exit 1
+```
+
+### Step 3: Start container
+
+No ORK/threshold/payer env vars are needed — the image ships with working defaults. Do not add them.
+
+```bash
+sudo docker run -d --name tidecloak \
+  -v "$(pwd)/data:/opt/keycloak/data/h2" \
+  -p 8080:8080 \
+  -e KC_BOOTSTRAP_ADMIN_USERNAME="${KC_BOOTSTRAP_ADMIN_USERNAME:-admin}" \
+  -e KC_BOOTSTRAP_ADMIN_PASSWORD="$KC_BOOTSTRAP_ADMIN_PASSWORD" \
+  tideorg/tidecloak-dev:latest
+```
+
+> ⚠️ **The admin password comes from `.env`, never from a script or the command line.** Copy
+> `templates/shared/.env.template` → `.env` (gitignored), set `KC_BOOTSTRAP_ADMIN_PASSWORD`, and let the
+> shell expand it as above. A literal `KC_BOOTSTRAP_ADMIN_PASSWORD=password` is a hardcoded credential
+> that also lands in shell history, CI logs and `ps` output (AP-41). Bootstrap scripts must **fail
+> loudly** when it is unset — a default password is a hardcoded credential with extra steps.
+
+### Step 4: Wait for readiness
+
+```bash
+for i in {1..15}; do
+  curl -sf http://localhost:8080 > /dev/null 2>&1 && echo "TideCloak ready" && break
+  echo "Waiting (attempt $i/15)..."
+  sleep 5
+done
+```
+
+TideCloak typically takes 30–60 seconds to start. If it does not respond after 15 attempts, check `docker logs tidecloak`.
+
+---
+
+## Verification
+
+- [ ] `docker ps` shows `tidecloak` running
+- [ ] `curl -sf http://localhost:8080` succeeds (the root answers **302** to `/realms/master/tide-console/`; `-f` treats that as success. The stock admin console is at `/kc`)
+- [ ] `docker logs tidecloak` shows no fatal errors
+
+---
+
+## Common Failures
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| Container exits immediately | Stale H2 DB files | `sudo rm -f ./data/keycloakdb*` and restart |
+| `AccessDeniedException` in logs | Wrong data directory mount or permissions | Mount `./data` not `.`, run `sudo chown -R 1000:1000 ./data` |
+| Port already in use | Another container or service on 8080 | `docker rm -f $(docker ps -q --filter publish=8080)` |
+| Exit code 2, HTTPS warnings | Named volume from previous docker-compose | `docker volume rm <volume_name>`, use fresh `./data` |
+
+---
+
+## Anti-Patterns
+
+- **Do not** mount project root as data volume. Use `./data` subdirectory.
+- **Do not** use `tideorg/tidecloak-stg-dev` or any `-stg` image. `tideorg/tidecloak-dev:latest` is the only supported one.
+- **Do not** set `SYSTEM_HOME_ORK`, `USER_HOME_ORK`, `THRESHOLD_T`, `THRESHOLD_N` or `PAYER_PUBLIC`. The image has working defaults; overriding them by hand risks a broken threshold configuration.
+- **Do not** use `THRESHOLD_T=1` anywhere. Single-ORK compromise.
+- **Do not** reuse data directory across environments. Clean between setups.
+
+---
+
+## Next Step
+
+Proceed to playbook `bootstrap-realm-from-template`.
